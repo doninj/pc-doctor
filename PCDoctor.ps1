@@ -5105,8 +5105,8 @@ Read-Host 'Appuyez sur Entree pour fermer'
             try {
                 # L'exe est en cours d'utilisation (l'appli tourne dedans) : Windows interdit de l'écraser
                 # mais autorise à le renommer. On le met de côté, puis on place le nouveau à sa place.
-                $old = "$ExePath.old"
-                Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+                # Nom unique : une ancienne copie peut elle-même encore tourner (boîte noire, widget…)
+                $old = "$ExePath.$(Get-Date -Format 'yyyyMMddHHmmss').old"
                 Move-Item -LiteralPath $ExePath -Destination $old -Force
                 try { Move-Item -LiteralPath $script:UpdateTmp -Destination $ExePath -Force }
                 catch { Move-Item -LiteralPath $old -Destination $ExePath -Force; throw }
@@ -5145,7 +5145,11 @@ Read-Host 'Appuyez sur Entree pour fermer'
     $ui.ChkWidgetAutostart.Add_Unchecked({ if (-not $script:Loading) { Set-WidgetAutostart $false; Set-Status 'Le widget ne s''affichera plus au démarrage.' } })
 
     # Ancienne version mise de côté lors d'une mise à jour : on la supprime (si plus rien ne l'utilise)
-    if ($ExePath) { Remove-Item -LiteralPath "$ExePath.old" -Force -ErrorAction SilentlyContinue }
+    if ($ExePath) {
+        $leaf = Split-Path -Leaf $ExePath
+        Get-ChildItem -LiteralPath (Split-Path -Parent $ExePath) -Filter "$leaf*.old" -File -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }   # celles encore utilisées restent jusqu'à la prochaine fois
+    }
 
     # --- État initial des réglages ---
     $cfg = Get-Settings

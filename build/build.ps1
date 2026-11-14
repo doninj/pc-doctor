@@ -21,8 +21,8 @@ $sma = [System.Management.Automation.PSObject].Assembly.Location
 if ($LASTEXITCODE -ne 0) { throw "Échec de la compilation ($LASTEXITCODE)" }
 # Si l'ancien exe est en cours d'utilisation, on le renomme (Windows l'autorise) avant de mettre le nouveau
 if (Test-Path -LiteralPath $final) {
-    Remove-Item -LiteralPath "$final.old" -Force -ErrorAction SilentlyContinue
-    try { Remove-Item -LiteralPath $final -Force -ErrorAction Stop } catch { Move-Item -LiteralPath $final -Destination "$final.old" -Force }
+    Get-ChildItem -LiteralPath $root -Filter 'PC Doctor.exe*.old' -File -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    try { Remove-Item -LiteralPath $final -Force -ErrorAction Stop } catch { Move-Item -LiteralPath $final -Destination "$final.$(Get-Date -Format 'yyyyMMddHHmmss').old" -Force }
 }
 Move-Item -LiteralPath $out -Destination $final
 "Exécutable créé : $final ($([math]::Round((Get-Item $final).Length / 1KB)) Ko)"
