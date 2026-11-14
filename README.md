@@ -9,7 +9,9 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><b>⬇ Télécharger PC Doctor.exe</b></a>
+  <a href="https://github.com/doninj/pc-doctor/releases/latest/download/PC-Doctor.exe"><b>⬇ Télécharger PC Doctor.exe</b></a>
+  &nbsp;·&nbsp;
+  <a href="../../releases">Toutes les versions</a>
 </p>
 
 ---
@@ -32,7 +34,7 @@ Rien n'est modifié sans confirmation. Les réglages (démarrage, limite de puis
 
 ## Installation
 
-1. Téléchargez **`PC Doctor.exe`** depuis la [dernière version](../../releases/latest).
+1. Téléchargez **[`PC-Doctor.exe`](https://github.com/doninj/pc-doctor/releases/latest/download/PC-Doctor.exe)** (dernière version).
 2. Double-cliquez dessus. Pas d'installation nécessaire.
 3. Pour tout analyser et tout pouvoir modifier, cliquez sur **« Passer en administrateur »** en bas à gauche.
 
