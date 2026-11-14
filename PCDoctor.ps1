@@ -301,6 +301,238 @@ namespace PCDoctor {
     }
 
     // ---------------------------------------------------------------------
+    //  Test de stabilité : charge processeur, RAM et carte graphique, avec
+    //  arrêt automatique si les températures dépassent les seuils.
+    // ---------------------------------------------------------------------
+    public static class StressTest {
+        public static volatile bool Running;
+        public static volatile string StopReason = "";     // "", "time", "user", "cputemp", "gputemp", "gpudriver"
+        public static volatile string GpuStatus = "", RamStatus = "";
+        public static bool UseCpu, UseRam, UseGpu;
+        public static DateTime Started, Ends, StoppedAt;
+        public static double CpuLimit = 90, GpuLimit = 87;
+        public static double MaxCpuTemp = -1, MaxGpuTemp = -1, MaxGpuPower = -1, GpuPowerLimit = -1, MaxCpu = -1, MaxGpuUsage = -1;
+        public static long RamErrors, RamPasses;
+        public static double RamGB;
+        public static SensorSnapshot Last = new SensorSnapshot();
+        static readonly List<double[]> _hist = new List<double[]>();
+        static volatile bool _run;
+        static List<Thread> _threads = new List<Thread>();
+        static string _marker;
+        public static double Sink;
+        public static uint GpuMaxGroups = 65535;   // plafond de charge (réduit pour les essais)
+
+        public static void Start(bool cpu, bool ram, bool gpu, int minutes, string marker, string smiPath) {
+            if (Running) return;
+            UseCpu = cpu; UseRam = ram; UseGpu = gpu;
+            StopReason = ""; GpuStatus = gpu ? "Démarrage…" : ""; RamStatus = ram ? "Réservation de la mémoire…" : "";
+            MaxCpuTemp = MaxGpuTemp = MaxGpuPower = GpuPowerLimit = MaxCpu = MaxGpuUsage = -1;
+            RamErrors = 0; RamPasses = 0; RamGB = 0;
+            lock (_hist) _hist.Clear();
+            _marker = marker;
+            Started = DateTime.Now; Ends = Started.AddMinutes(minutes);
+            _run = true; Running = true;
+            _threads.Clear();
+            LiveSensors.Start(smiPath, Path.GetPathRoot(Environment.SystemDirectory));
+            WriteMarker();
+            if (cpu) for (int i = 0; i < Environment.ProcessorCount; i++) Spawn(CpuWork, ThreadPriority.BelowNormal);
+            if (ram) Spawn(RamWork, ThreadPriority.BelowNormal);
+            if (gpu) Spawn(GpuWork, ThreadPriority.Normal);
+            Spawn(Monitor, ThreadPriority.AboveNormal);
+        }
+
+        public static void Stop(string reason) {
+            if (!_run) return;
+            if (StopReason == "") StopReason = reason;
+            _run = false;
+        }
+
+        static void Spawn(ThreadStart f, ThreadPriority p) {
+            Thread t = new Thread(f); t.IsBackground = true; t.Priority = p; t.Start(); _threads.Add(t);
+        }
+
+        // Historique pour les courbes : 0 = temp. CPU, 1 = temp. GPU, 2 = conso GPU, 3 = charge CPU
+        public static double[] History(int col) {
+            lock (_hist) { double[] r = new double[_hist.Count]; for (int i = 0; i < r.Length; i++) r[i] = _hist[i][col]; return r; }
+        }
+
+        static void WriteMarker() {
+            try {
+                File.WriteAllText(_marker, string.Format(CultureInfo.InvariantCulture,
+                    "start={0:yyyy-MM-ddTHH:mm:ss}\nlast={1:yyyy-MM-ddTHH:mm:ss}\ncpu={2}\nram={3}\ngpu={4}\nmaxcputemp={5:0}\nmaxgputemp={6:0}\nmaxgpupower={7:0}\nramerrors={8}\n",
+                    Started, DateTime.Now, UseCpu ? 1 : 0, UseRam ? 1 : 0, UseGpu ? 1 : 0, MaxCpuTemp, MaxGpuTemp, MaxGpuPower, RamErrors));
+            } catch { }
+        }
+
+        static void Monitor() {
+            int hotCpu = 0, hotGpu = 0, tick = 0;
+            LiveSensors.Read();
+            while (_run) {
+                Thread.Sleep(1000);
+                SensorSnapshot s = LiveSensors.Read();
+                Last = s;
+                if (s.CpuTemp > MaxCpuTemp) MaxCpuTemp = s.CpuTemp;
+                if (s.GpuTemp > MaxGpuTemp) MaxGpuTemp = s.GpuTemp;
+                if (s.GpuPower > MaxGpuPower) MaxGpuPower = s.GpuPower;
+                if (s.GpuPowerLimit > 0) GpuPowerLimit = s.GpuPowerLimit;
+                if (s.Cpu > MaxCpu && tick > 2) MaxCpu = s.Cpu;
+                if (s.GpuUsage > MaxGpuUsage) MaxGpuUsage = s.GpuUsage;
+                hotCpu = s.CpuTemp >= CpuLimit ? hotCpu + 1 : 0;
+                hotGpu = s.GpuTemp >= GpuLimit ? hotGpu + 1 : 0;
+                if (hotCpu >= 2) Stop("cputemp");
+                else if (hotGpu >= 2) Stop("gputemp");
+                else if (DateTime.Now >= Ends) Stop("time");
+                tick++;
+                if (tick % 2 == 0) lock (_hist) _hist.Add(new double[] { s.CpuTemp, s.GpuTemp, s.GpuPower, s.Cpu });
+                if (tick % 5 == 0) WriteMarker();
+            }
+            foreach (Thread t in _threads) if (t != Thread.CurrentThread) { try { t.Join(5000); } catch { } }
+            StoppedAt = DateTime.Now;
+            LiveSensors.Stop();
+            try { File.Delete(_marker); } catch { }
+            Running = false;
+        }
+
+        // --- Processeur : calcul flottant en continu sur chaque cœur logique ---
+        static void CpuWork() {
+            double a = 1.1, b = 1.2, c = 1.3, d = 1.4, e = 1.5, f = 1.6, g = 1.7, h = 1.8;
+            while (_run) {
+                for (int i = 0; i < 2000000; i++) {
+                    a = a * 0.999999 + 0.000001; b = b * 0.999998 + 0.000002;
+                    c = c * 0.999997 + 0.000003; d = d * 0.999996 + 0.000004;
+                    e = e * 0.999995 + 0.000005; f = f * 0.999994 + 0.000006;
+                    g = g * 0.999993 + 0.000007; h = h * 0.999992 + 0.000008;
+                    if ((i & 1023) == 0) a += Math.Sqrt(b + c) * 1e-12;
+                }
+                Sink = a + b + c + d + e + f + g + h;
+            }
+        }
+
+        // --- Mémoire vive : écrit un motif puis le relit ; toute différence est une erreur ---
+        static void RamWork() {
+            List<long[]> blocks = new List<long[]>();
+            try {
+                SensorSnapshot s = LiveSensors.Read();
+                double availGB = s.RamTotalGB - s.RamUsedGB;
+                double targetGB = Math.Min(availGB - 2.5, s.RamTotalGB * 0.7);
+                if (targetGB < 0.5) targetGB = 0.5;
+                const int blockLongs = 32 * 1024 * 1024;      // 256 Mo
+                int count = (int)(targetGB * 4);
+                for (int i = 0; i < count && _run; i++) {
+                    try { blocks.Add(new long[blockLongs]); } catch (OutOfMemoryException) { break; }
+                    RamGB = blocks.Count / 4.0;
+                }
+                RamStatus = "";
+                ulong seed = 0x9E3779B97F4A7C15UL;
+                while (_run) {
+                    seed = seed * 6364136223846793005UL + 1442695040888963407UL;
+                    for (int bi = 0; bi < blocks.Count && _run; bi++) {
+                        long[] blk = blocks[bi];
+                        ulong x = seed ^ (ulong)bi;
+                        for (int j = 0; j < blk.Length; j++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; blk[j] = (long)x; }
+                    }
+                    for (int bi = 0; bi < blocks.Count && _run; bi++) {
+                        long[] blk = blocks[bi];
+                        ulong x = seed ^ (ulong)bi;
+                        for (int j = 0; j < blk.Length; j++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; if (blk[j] != (long)x) Interlocked.Increment(ref RamErrors); }
+                    }
+                    if (_run) Interlocked.Increment(ref RamPasses);
+                }
+            } catch (Exception ex) { RamStatus = "Erreur : " + ex.Message; }
+            finally { blocks.Clear(); blocks = null; GC.Collect(); }
+        }
+
+        // --- Carte graphique : calcul Direct3D 11 (compute shader), par lots courts ---
+        [DllImport("d3d11.dll")] static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software, uint flags, IntPtr levels, uint numLevels, uint sdk, out IntPtr device, out int level, out IntPtr context);
+        [DllImport("d3dcompiler_47.dll")] static extern int D3DCompile([MarshalAs(UnmanagedType.LPStr)] string src, IntPtr size, IntPtr name, IntPtr defines, IntPtr include, [MarshalAs(UnmanagedType.LPStr)] string entry, [MarshalAs(UnmanagedType.LPStr)] string target, uint f1, uint f2, out IntPtr code, out IntPtr errors);
+        [StructLayout(LayoutKind.Sequential)] struct BUFFER_DESC { public uint ByteWidth; public int Usage; public uint BindFlags, CPUAccessFlags, MiscFlags, StructureByteStride; }
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate uint FRelease(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate IntPtr FBlobPtr(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int FCreateBuffer(IntPtr self, ref BUFFER_DESC d, IntPtr init, out IntPtr buf);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int FCreateUav(IntPtr self, IntPtr res, int[] desc, out IntPtr uav);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int FCreateCs(IntPtr self, IntPtr code, IntPtr len, IntPtr linkage, out IntPtr cs);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int FCreateQuery(IntPtr self, int[] desc, out IntPtr q);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void FCsSetShader(IntPtr self, IntPtr cs, IntPtr inst, uint n);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void FCsSetUavs(IntPtr self, uint start, uint n, IntPtr[] uavs, IntPtr counts);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void FDispatch(IntPtr self, uint x, uint y, uint z);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void FEnd(IntPtr self, IntPtr q);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int FGetData(IntPtr self, IntPtr q, IntPtr data, uint size, uint flags);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void FFlush(IntPtr self);
+        static T Fn<T>(IntPtr obj, int slot) where T : class {
+            IntPtr vt = Marshal.ReadIntPtr(obj);
+            return (T)(object)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(vt, slot * IntPtr.Size), typeof(T));
+        }
+        static void Rel(IntPtr p) { if (p != IntPtr.Zero) try { Fn<FRelease>(p, 2)(p); } catch { } }
+
+        const string Shader = @"
+RWBuffer<float> o : register(u0);
+[numthreads(256,1,1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    float4 a = float4(id.x * 1e-7, 0.5, 0.25, 0.125);
+    float4 b = a + 0.3, c = a + 0.6, d = a + 0.9;
+    [loop] for (int i = 0; i < 2048; i++) {
+        a = mad(a, 0.9999, 0.0001); b = mad(b, 0.9998, 0.0002);
+        c = mad(c, 0.9997, 0.0003); d = mad(d, 0.9996, 0.0004);
+        a = mad(b, c, a) * 0.5;
+    }
+    float s = dot(a + b, c + d);
+    if (s == 1.2345) o[id.x & 1023] = s;
+}";
+
+        static void GpuWork() {
+            IntPtr dev = IntPtr.Zero, ctx = IntPtr.Zero, code = IntPtr.Zero, err = IntPtr.Zero, cs = IntPtr.Zero, buf = IntPtr.Zero, uav = IntPtr.Zero;
+            IntPtr[] q = new IntPtr[2];
+            try {
+                int lvl;
+                int hr = D3D11CreateDevice(IntPtr.Zero, 1, IntPtr.Zero, 0, IntPtr.Zero, 0, 7, out dev, out lvl, out ctx);
+                if (hr < 0) { GpuStatus = "Erreur : Direct3D 11 indisponible (0x" + hr.ToString("X8") + ")"; return; }
+                try { hr = D3DCompile(Shader, (IntPtr)Shader.Length, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, "main", "cs_5_0", 0, 0, out code, out err); }
+                catch (DllNotFoundException) { GpuStatus = "Erreur : compilateur Direct3D introuvable"; return; }
+                if (hr < 0) { GpuStatus = "Erreur : compilation du test (0x" + hr.ToString("X8") + ")"; return; }
+                IntPtr cptr = Fn<FBlobPtr>(code, 3)(code), clen = Fn<FBlobPtr>(code, 4)(code);
+                hr = Fn<FCreateCs>(dev, 18)(dev, cptr, clen, IntPtr.Zero, out cs);
+                if (hr < 0) { GpuStatus = "Erreur : carte graphique incompatible (0x" + hr.ToString("X8") + ")"; return; }
+                BUFFER_DESC bd = new BUFFER_DESC { ByteWidth = 4096, Usage = 0, BindFlags = 0x80 };
+                hr = Fn<FCreateBuffer>(dev, 3)(dev, ref bd, IntPtr.Zero, out buf);
+                if (hr < 0) { GpuStatus = "Erreur : mémoire graphique (0x" + hr.ToString("X8") + ")"; return; }
+                hr = Fn<FCreateUav>(dev, 8)(dev, buf, new int[] { 41, 1, 0, 1024, 0 }, out uav);   // R32_FLOAT, tampon de 1024 éléments
+                if (hr < 0) { GpuStatus = "Erreur : vue mémoire (0x" + hr.ToString("X8") + ")"; return; }
+                for (int i = 0; i < 2; i++) { hr = Fn<FCreateQuery>(dev, 24)(dev, new int[] { 0, 0 }, out q[i]); if (hr < 0) { GpuStatus = "Erreur : requête (0x" + hr.ToString("X8") + ")"; return; } }
+                Fn<FCsSetShader>(ctx, 69)(ctx, cs, IntPtr.Zero, 0);
+                Fn<FCsSetUavs>(ctx, 68)(ctx, 0, 1, new IntPtr[] { uav }, IntPtr.Zero);
+                FDispatch dispatch = Fn<FDispatch>(ctx, 41); FEnd end = Fn<FEnd>(ctx, 28); FGetData getData = Fn<FGetData>(ctx, 29); FFlush flush = Fn<FFlush>(ctx, 111);
+                uint groups = Math.Min(64u, GpuMaxGroups);
+                bool[] pending = new bool[2];
+                int cur = 0;
+                Stopwatch sw = Stopwatch.StartNew();
+                GpuStatus = "";
+                while (_run) {
+                    dispatch(ctx, groups, 1, 1);
+                    end(ctx, q[cur]); flush(ctx); pending[cur] = true;
+                    int prev = 1 - cur;
+                    if (pending[prev]) {
+                        int r;
+                        while ((r = getData(ctx, q[prev], IntPtr.Zero, 0, 0)) == 1) { if (!_run) break; Thread.Sleep(1); }
+                        if (r < 0) { GpuStatus = "Erreur : le pilote de la carte graphique a planté (0x" + r.ToString("X8") + ")"; Stop("gpudriver"); break; }
+                        pending[prev] = false;
+                        double ms = sw.Elapsed.TotalMilliseconds; sw.Restart();
+                        // Lots de 15 à 40 ms : la carte reste chargée sans dépasser le délai de sécurité de Windows (2 s)
+                        if (ms < 15 && groups < GpuMaxGroups) groups = Math.Min(GpuMaxGroups, groups * 2);
+                        else if (ms > 40 && groups > 1) groups = Math.Max(1u, groups / 2);
+                    }
+                    cur = prev;
+                }
+                // attendre la fin des lots en cours avant de libérer
+                for (int i = 0; i < 2; i++) if (pending[i]) { int w = 0; while (getData(ctx, q[i], IntPtr.Zero, 0, 0) == 1 && w++ < 3000) Thread.Sleep(1); }
+            } catch (Exception ex) { GpuStatus = "Erreur : " + ex.Message; }
+            finally {
+                Rel(q[0]); Rel(q[1]); Rel(uav); Rel(buf); Rel(cs); Rel(code); Rel(err); Rel(ctx); Rel(dev);
+                if (GpuStatus.StartsWith("Erreur") && !UseCpu && !UseRam) Stop("gpuerror");
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
     //  Boîte noire : enregistre l'état du PC toutes les 2 s (icône de notification)
     // ---------------------------------------------------------------------
     public static class BlackBox {
@@ -815,7 +1047,7 @@ if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp
 # ---------------------------------------------------------------------------
 #  Réglages partagés (appli + boîte noire) : %LOCALAPPDATA%\PCDoctor\settings.ini
 # ---------------------------------------------------------------------------
-$script:AppVersion = '2.4.0'
+$script:AppVersion = '2.5.0'
 $script:Repo = 'doninj/pc-doctor'
 $script:SettingsFile = Join-Path $script:LogDir 'settings.ini'
 $script:BlackBoxDir = Join-Path $script:LogDir 'boite-noire'
@@ -2132,6 +2364,12 @@ function Get-Solutions($d) {
                 @((& $act 'Activer la boîte noire' 'bb-start'), (& $act 'En savoir plus' 'goto:blackbox'))
         }
     }
+    if ($cs.Hard.Count) {
+        & $addS $false 'Reproduire la coupure avec le test de stabilité' `
+            "Plutôt que d'attendre la prochaine coupure, provoquez-la : le test fait tourner le processeur, la mémoire et la carte graphique à fond pendant 5 à 15 minutes en surveillant les températures. Si le PC se coupe, la boîte noire montre pourquoi ; s'il tient, l'alimentation et le refroidissement supportent la pleine charge." `
+            "1. Enregistrez vos documents et fermez vos jeux.`n2. Lancez Core Temp pour que la température du processeur soit surveillée.`n3. Page Test de stabilité > « Lancer le test » (10 minutes)." `
+            @((& $act 'Ouvrir le test de stabilité' 'goto:stress'))
+    }
 
     # 1. RAM EXPO / XMP
     $bios = "Cherchez l'option EXPO, XMP ou DOCP et mettez-la sur « Désactivé » ou « Auto »."
@@ -2605,6 +2843,12 @@ $xamlText = @'
           </ListBoxItem>
           <ListBoxItem>
             <DockPanel>
+              <Ellipse x:Name="NavStressDot" Width="8" Height="8" Fill="#FFEF4444" DockPanel.Dock="Right" VerticalAlignment="Center" Visibility="Collapsed"/>
+              <TextBlock Style="{StaticResource NavIcon}" Text="&#xE945;"/><TextBlock Style="{StaticResource NavText}" Text="Test de stabilité"/>
+            </DockPanel>
+          </ListBoxItem>
+          <ListBoxItem>
+            <DockPanel>
               <Border x:Name="BadgeDrivers" Style="{StaticResource Badge}" Background="#FFF59E0B" DockPanel.Dock="Right"><TextBlock x:Name="BadgeDriversText" Style="{StaticResource BadgeText}"/></Border>
               <TextBlock Style="{StaticResource NavIcon}" Text="&#xE772;"/><TextBlock Style="{StaticResource NavText}" Text="Pilotes"/>
             </DockPanel>
@@ -2992,6 +3236,128 @@ $xamlText = @'
                       </DataGrid.Columns>
                     </DataGrid>
                   </Border>
+                </StackPanel>
+              </Border>
+            </StackPanel>
+          </ScrollViewer>
+        </TabItem>
+
+        <!-- TEST DE STABILITÉ -->
+        <TabItem>
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="StressRoot" Margin="32,28,32,24">
+              <TextBlock Style="{StaticResource PageTitle}" Text="Test de stabilité"/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Fait tourner le processeur, la mémoire vive et la carte graphique à fond pendant quelques minutes, en surveillant les températures. Si le PC se coupe pendant le test, le problème est reproduit et la boîte noire montre pourquoi."/>
+              <Border x:Name="StressCrashBox" Background="#FFFEF2F2" BorderBrush="#FFFBCACA" BorderThickness="1" CornerRadius="12" Padding="18,14" Margin="0,18,0,0" Visibility="Collapsed">
+                <DockPanel>
+                  <Button x:Name="BtnStressCrashBb" DockPanel.Dock="Right" Content="Voir la boîte noire" VerticalAlignment="Center" Margin="12,0,0,0"/>
+                  <StackPanel>
+                    <TextBlock x:Name="TxtStressCrashTitle" FontSize="16" FontWeight="SemiBold" Foreground="#FFEF4444" TextWrapping="Wrap"/>
+                    <TextBlock x:Name="TxtStressCrash" TextWrapping="Wrap" Margin="0,6,0,0" LineHeight="20"/>
+                  </StackPanel>
+                </DockPanel>
+              </Border>
+              <Grid Margin="0,18,0,20">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="5*"/>
+                  <ColumnDefinition Width="16"/>
+                  <ColumnDefinition Width="7*"/>
+                </Grid.ColumnDefinitions>
+                <Border Style="{StaticResource Card}">
+                  <StackPanel>
+                    <TextBlock Text="Réglages" FontSize="18" FontWeight="SemiBold"/>
+                    <TextBlock Style="{StaticResource MutedText}" FontSize="12" Margin="0,12,0,6" Text="CE QUI EST TESTÉ"/>
+                    <CheckBox x:Name="ChkStressCpu" Content="Processeur (tous les cœurs)" IsChecked="True" Margin="0,0,0,6"/>
+                    <CheckBox x:Name="ChkStressRam" Content="Mémoire vive (écriture et vérification)" IsChecked="True" Margin="0,0,0,6"/>
+                    <CheckBox x:Name="ChkStressGpu" Content="Carte graphique (calcul Direct3D)" IsChecked="True"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,14,0,0">
+                      <TextBlock Text="Durée :" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                      <ComboBox x:Name="CmbStressMinutes" Width="110" Padding="8,4" SelectedIndex="1">
+                        <ComboBoxItem Content="5 minutes"/>
+                        <ComboBoxItem Content="10 minutes"/>
+                        <ComboBoxItem Content="15 minutes"/>
+                      </ComboBox>
+                    </StackPanel>
+                    <WrapPanel Margin="0,16,0,0">
+                      <Button x:Name="BtnStressStart" Margin="0,0,8,6">
+                        <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE768;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Lancer le test"/></StackPanel>
+                      </Button>
+                      <Button x:Name="BtnStressStop" Content="Arrêter" Style="{StaticResource Danger}" Margin="0,0,8,6" IsEnabled="False"/>
+                    </WrapPanel>
+                    <Border x:Name="StressCpuTempBox" Background="#FFF7F9FC" CornerRadius="8" Padding="10,8" Margin="0,10,0,0">
+                      <DockPanel>
+                        <Button x:Name="BtnStressCoreTemp" DockPanel.Dock="Right" Content="Lancer Core Temp" Style="{StaticResource Small}" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                        <TextBlock x:Name="TxtStressCpuTemp" TextWrapping="Wrap" FontSize="12" VerticalAlignment="Center"/>
+                      </DockPanel>
+                    </Border>
+                    <TextBlock Style="{StaticResource MutedText}" FontSize="12" TextWrapping="Wrap" Margin="0,10,0,0" LineHeight="18" Text="Arrêt automatique si le processeur atteint 90 °C ou la carte graphique 87 °C. Enregistrez vos documents et fermez vos jeux avant : si le PC se coupe, ce qui n'est pas enregistré est perdu. La boîte noire est lancée automatiquement."/>
+                  </StackPanel>
+                </Border>
+                <Border Grid.Column="2" Style="{StaticResource Card}">
+                  <StackPanel>
+                    <DockPanel>
+                      <TextBlock x:Name="TxtStressTime" DockPanel.Dock="Right" Style="{StaticResource MutedText}" FontSize="13" VerticalAlignment="Center"/>
+                      <TextBlock x:Name="TxtStressState" Text="Prêt" FontSize="18" FontWeight="SemiBold"/>
+                    </DockPanel>
+                    <ProgressBar x:Name="BarStress" Maximum="100" Margin="0,10,0,0"/>
+                    <UniformGrid Columns="4" Margin="0,18,-14,0">
+                      <StackPanel Margin="0,0,14,0">
+                        <TextBlock Text="Processeur" Style="{StaticResource MutedText}" FontSize="12"/>
+                        <TextBlock x:Name="TxtStressCpuT" Text="—" FontSize="24" FontWeight="SemiBold" Margin="0,2,0,2"/>
+                        <TextBlock x:Name="TxtStressCpuSub" Style="{StaticResource MutedText}" FontSize="11.5" TextWrapping="Wrap"/>
+                      </StackPanel>
+                      <StackPanel Margin="0,0,14,0">
+                        <TextBlock Text="Carte graphique" Style="{StaticResource MutedText}" FontSize="12"/>
+                        <TextBlock x:Name="TxtStressGpuT" Text="—" FontSize="24" FontWeight="SemiBold" Margin="0,2,0,2"/>
+                        <TextBlock x:Name="TxtStressGpuSub" Style="{StaticResource MutedText}" FontSize="11.5" TextWrapping="Wrap"/>
+                      </StackPanel>
+                      <StackPanel Margin="0,0,14,0">
+                        <TextBlock Text="Consommation GPU" Style="{StaticResource MutedText}" FontSize="12"/>
+                        <TextBlock x:Name="TxtStressGpuW" Text="—" FontSize="24" FontWeight="SemiBold" Margin="0,2,0,2"/>
+                        <TextBlock x:Name="TxtStressGpuWSub" Style="{StaticResource MutedText}" FontSize="11.5" TextWrapping="Wrap"/>
+                      </StackPanel>
+                      <StackPanel Margin="0,0,14,0">
+                        <TextBlock Text="Mémoire vive" Style="{StaticResource MutedText}" FontSize="12"/>
+                        <TextBlock x:Name="TxtStressRam" Text="—" FontSize="24" FontWeight="SemiBold" Margin="0,2,0,2"/>
+                        <TextBlock x:Name="TxtStressRamSub" Style="{StaticResource MutedText}" FontSize="11.5" TextWrapping="Wrap"/>
+                      </StackPanel>
+                    </UniformGrid>
+                    <UniformGrid Columns="3" Margin="0,16,-10,0">
+                      <Border Background="#FFF7F9FC" CornerRadius="10" Padding="10,8" Margin="0,0,10,0">
+                        <StackPanel>
+                          <TextBlock Text="Temp. processeur" FontWeight="SemiBold" FontSize="12"/>
+                          <Canvas x:Name="ChartStressCpuT" Height="70" Margin="0,6,0,0" ClipToBounds="True"/>
+                        </StackPanel>
+                      </Border>
+                      <Border Background="#FFF7F9FC" CornerRadius="10" Padding="10,8" Margin="0,0,10,0">
+                        <StackPanel>
+                          <TextBlock Text="Temp. carte graphique" FontWeight="SemiBold" FontSize="12"/>
+                          <Canvas x:Name="ChartStressGpuT" Height="70" Margin="0,6,0,0" ClipToBounds="True"/>
+                        </StackPanel>
+                      </Border>
+                      <Border Background="#FFF7F9FC" CornerRadius="10" Padding="10,8" Margin="0,0,10,0">
+                        <StackPanel>
+                          <TextBlock Text="Conso. carte graphique" FontWeight="SemiBold" FontSize="12"/>
+                          <Canvas x:Name="ChartStressGpuW" Height="70" Margin="0,6,0,0" ClipToBounds="True"/>
+                        </StackPanel>
+                      </Border>
+                    </UniformGrid>
+                  </StackPanel>
+                </Border>
+              </Grid>
+              <Border x:Name="StressResult" Style="{StaticResource Card}" Visibility="Collapsed">
+                <StackPanel>
+                  <StackPanel Orientation="Horizontal">
+                    <Ellipse x:Name="StressResultDot" Width="12" Height="12" Fill="#FF22C55E" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="TxtStressResultTitle" FontSize="17" FontWeight="SemiBold" Margin="10,0,0,0" TextWrapping="Wrap"/>
+                  </StackPanel>
+                  <Border Background="#FFF7F9FC" CornerRadius="10" Padding="14,12" Margin="0,10,0,0">
+                    <TextBlock x:Name="TxtStressResult" TextWrapping="Wrap" LineHeight="21"/>
+                  </Border>
+                  <WrapPanel Margin="0,12,0,0">
+                    <Button x:Name="BtnStressResultBb" Content="Voir la boîte noire pendant le test" Style="{StaticResource Secondary}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnStressSolutions" Content="Voir les solutions" Style="{StaticResource Secondary}" Margin="0"/>
+                  </WrapPanel>
                 </StackPanel>
               </Border>
             </StackPanel>
@@ -3905,7 +4271,7 @@ try {
 
     function Set-Status([string]$t) { $script:ui.TxtStatus.Text = $t }
 
-    $script:Pages = @{ diag = 0; solutions = 1; blackbox = 2; drivers = 3; software = 4; perf = 5; network = 6; startup = 7; procs = 8; crashes = 9; disk = 10; clean = 11; settings = 12 }
+    $script:Pages = @{ diag = 0; solutions = 1; blackbox = 2; stress = 3; drivers = 4; software = 5; perf = 6; network = 7; startup = 8; procs = 9; crashes = 10; disk = 11; clean = 12; settings = 13 }
     function Show-Page([string]$name) { if ($script:Pages.ContainsKey($name)) { $ui.NavList.SelectedIndex = $script:Pages[$name] } }
     $script:DriversLoaded = $false
     $script:SoftwareLoaded = $false
@@ -4581,6 +4947,13 @@ Read-Host 'Appuyez sur Entree pour fermer'
             }
             try { Update-ScanProgress } catch { Write-Log "Scan : $_" }
             try { Step-GpuPoll } catch { Write-Log "GPU : $_" }
+            if (($script:StressWasRunning -or [PCDoctor.StressTest]::Running) -and [DateTime]::Now -ge $script:StressNextUi) {
+                $script:StressNextUi = [DateTime]::Now.AddSeconds(1)
+                try {
+                    Update-StressUi
+                    if ($script:StressWasRunning -and -not [PCDoctor.StressTest]::Running) { $script:StressWasRunning = $false; Complete-StressTest }
+                } catch { Write-Log "Test : $_ $($_.ScriptStackTrace)" }
+            }
             if ($script:BbRefreshAt -and [DateTime]::Now -ge $script:BbRefreshAt) {
                 $script:BbRefreshAt = $null
                 try { Update-BlackBoxStatus; Refresh-Solutions } catch { Write-Log "Boîte noire : $_" }
@@ -4755,6 +5128,10 @@ Read-Host 'Appuyez sur Entree pour fermer'
             $ui.BtnBbCoreTemp.Content = if ($installed) { 'Lancer Core Temp' } else { 'Télécharger Core Temp' }
             $ui.BtnBbCoreTemp.Visibility = 'Visible'
         }
+        $ui.TxtStressCpuTemp.Text = $ui.TxtBbCpuTemp.Text -replace 'enregistrée', 'surveillée'
+        $ui.TxtStressCpuTemp.Foreground = $ui.TxtBbCpuTemp.Foreground
+        $ui.BtnStressCoreTemp.Content = $ui.BtnBbCoreTemp.Content
+        $ui.BtnStressCoreTemp.Visibility = $ui.BtnBbCoreTemp.Visibility
     }
     $ui.BtnBbCoreTemp.Add_Click({
             if ([PCDoctor.LiveSensors]::CoreTempInstalled()) {
@@ -4920,6 +5297,177 @@ Read-Host 'Appuyez sur Entree pour fermer'
             if ($b -is [System.Windows.Controls.Button] -and $b.Tag -eq 'bb-analyze' -and $b.DataContext.HasData) {
                 try { Show-BlackBoxWindow $b.DataContext.CutTime 5 $true } catch { Write-Log "Analyse : $_ $($_.ScriptStackTrace)"; Set-Status "Erreur d'analyse : $_" }
             }
+        })
+
+    # =====================================================================
+    #  Test de stabilité
+    # =====================================================================
+    $script:StressMarker = Join-Path $script:LogDir 'test-stabilite.txt'
+    $script:StressWasRunning = $false
+    $script:StressNextUi = [DateTime]::MinValue
+    $script:StressCrashTime = $null
+
+    function Format-Temp($v) { if ($v -gt 0) { "{0:N0} °C" -f $v } else { '—' } }
+    function Format-Duration([TimeSpan]$d) { if ($d.TotalSeconds -lt 90) { "{0:N0} s" -f $d.TotalSeconds } else { "{0:N0} min" -f $d.TotalMinutes } }
+    function ConvertTo-ChartValues($arr) { @($arr | ForEach-Object { if ($_ -gt 0) { $_ } else { $null } }) }
+
+    # Au lancement : un test était-il en cours quand le PC s'est coupé ?
+    function Test-StressCrash {
+        if (-not (Test-Path -LiteralPath $script:StressMarker)) { return $false }
+        $m = @{}
+        foreach ($l in @(Get-Content -LiteralPath $script:StressMarker -ErrorAction SilentlyContinue)) { $i = $l.IndexOf('='); if ($i -gt 0) { $m[$l.Substring(0, $i)] = $l.Substring($i + 1) } }
+        Remove-Item -LiteralPath $script:StressMarker -Force -ErrorAction SilentlyContinue
+        $inv = [Globalization.CultureInfo]::InvariantCulture
+        try { $start = [datetime]::ParseExact($m['start'], 'yyyy-MM-ddTHH:mm:ss', $inv); $last = [datetime]::ParseExact($m['last'], 'yyyy-MM-ddTHH:mm:ss', $inv) } catch { return $false }
+        $boot = $null
+        try { $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch {}
+        if (-not $boot -or $boot -lt $start) { return $false }   # pas de redémarrage : PC Doctor a seulement été fermé brutalement
+        $script:StressCrashTime = $last
+        $parts = @(); if ($m['cpu'] -eq '1') { $parts += 'processeur' }; if ($m['ram'] -eq '1') { $parts += 'mémoire' }; if ($m['gpu'] -eq '1') { $parts += 'carte graphique' }
+        $ct = 0.0; $gt = 0.0; $gw = 0.0; $re = 0
+        [void][double]::TryParse($m['maxcputemp'], [Globalization.NumberStyles]::Float, $inv, [ref]$ct)
+        [void][double]::TryParse($m['maxgputemp'], [Globalization.NumberStyles]::Float, $inv, [ref]$gt)
+        [void][double]::TryParse($m['maxgpupower'], [Globalization.NumberStyles]::Float, $inv, [ref]$gw)
+        [void][int]::TryParse($m['ramerrors'], [ref]$re)
+        $hot = ($ct -ge 88) -or ($gt -ge 85)
+        $txt = "Coupure après environ {0} de test ({1}). Valeurs maximales relevées : processeur {2}, carte graphique {3}{4}." -f (Format-Duration ($last - $start)), ($parts -join ', '), (Format-Temp $ct), (Format-Temp $gt), $(if ($gw -gt 0) { ", {0:N0} W" -f $gw } else { '' })
+        $txt += if ($hot) { "`nLes températures étaient très élevées juste avant : la surchauffe est la piste principale (ventilateurs, poussière, pâte thermique)." }
+        elseif ($re -gt 0) { "`nDes erreurs de mémoire avaient été détectées avant la coupure : la RAM est la piste principale." }
+        elseif ($ct -le 0) { "`nLa carte graphique n'était pas en surchauffe (la température du processeur n'était pas surveillée). Une coupure nette sous forte charge désigne souvent l'alimentation (ou ses câbles) : refaites le test avec Core Temp lancé pour écarter la surchauffe du processeur." }
+        else { "`nLes températures étaient normales : une coupure nette sous forte charge, sans surchauffe, désigne d'abord l'alimentation (ou ses câbles), puis la carte mère. La boîte noire montre les dernières secondes." }
+        $ui.TxtStressCrashTitle.Text = "Le PC s'est coupé pendant le test de stabilité du {0:dd/MM à HH:mm}" -f $start
+        $ui.TxtStressCrash.Text = $txt
+        $ui.StressCrashBox.Visibility = 'Visible'
+        $ui.NavStressDot.Visibility = 'Visible'
+        return $true
+    }
+
+    function Set-StressRunningUi([bool]$on) {
+        $ui.BtnStressStart.IsEnabled = -not $on
+        $ui.BtnStressStop.IsEnabled = $on
+        foreach ($c in @($ui.ChkStressCpu, $ui.ChkStressRam, $ui.ChkStressGpu, $ui.CmbStressMinutes)) { $c.IsEnabled = -not $on }
+    }
+
+    function Start-StressTest {
+        $cpu = [bool]$ui.ChkStressCpu.IsChecked; $ram = [bool]$ui.ChkStressRam.IsChecked; $gpu = [bool]$ui.ChkStressGpu.IsChecked
+        if (-not ($cpu -or $ram -or $gpu)) { Set-Status 'Cochez au moins un élément à tester.'; return }
+        $min = @(5, 10, 15)[[math]::Max(0, $ui.CmbStressMinutes.SelectedIndex)]
+        if ($cpu -and -not (Get-CpuTempSource)) {
+            $r = [System.Windows.MessageBox]::Show($window, "La température du processeur n'est pas surveillée (Core Temp ou HWiNFO n'est pas lancé) : l'arrêt automatique à 90 °C ne fonctionnera pas pour le processeur. Il se protège quand même tout seul en ralentissant s'il chauffe trop.`n`nLancer le test quand même ?", 'PC Doctor', 'YesNo', 'Warning')
+            if ($r -ne 'Yes') { return }
+        }
+        try { Start-BlackBox } catch { Write-Log "Test : boîte noire : $_" }
+        [PCDoctor.StressTest]::Start($cpu, $ram, $gpu, $min, $script:StressMarker, [string]$script:SmiPath)
+        $script:StressWasRunning = $true
+        $script:StressNextUi = [DateTime]::MinValue
+        Set-StressRunningUi $true
+        $ui.StressResult.Visibility = 'Collapsed'
+        $ui.StressCrashBox.Visibility = 'Collapsed'
+        $ui.NavStressDot.Visibility = 'Collapsed'
+        $ui.TxtStressState.Text = 'Test en cours…'
+        Set-Status "Test de stabilité lancé pour $min minutes. Le PC peut être lent pendant le test."
+        $script:BbRefreshAt = [DateTime]::Now.AddSeconds(3)
+    }
+
+    function Update-StressUi {
+        $T = [PCDoctor.StressTest]
+        $s = $T::Last
+        if ($T::Running) {
+            $now = Get-Date
+            $el = $now - $T::Started
+            $tot = ($T::Ends - $T::Started).TotalSeconds
+            $rem = $T::Ends - $now; if ($rem.TotalSeconds -lt 0) { $rem = [TimeSpan]::Zero }
+            $ui.BarStress.Value = [math]::Min(100, 100 * $el.TotalSeconds / $tot)
+            $ui.TxtStressTime.Text = "{0:mm\:ss} écoulées · reste {1:mm\:ss}" -f $el, $rem
+            $ui.TxtStressState.Text = if ($T::StopReason) { 'Arrêt en cours…' } else { 'Test en cours…' }
+        }
+        $ui.TxtStressCpuT.Text = Format-Temp $s.CpuTemp
+        $ui.TxtStressCpuT.Foreground = Get-Brush $(if ($s.CpuTemp -ge 85) { '#FFEF4444' } elseif ($s.CpuTemp -ge 78) { '#FFF59E0B' } else { '#FF0F172A' })
+        $ui.TxtStressCpuSub.Text = $(if ($s.Cpu -ge 0) { "charge {0:N0} %" -f $s.Cpu } else { '' }) + $(if ($T::MaxCpuTemp -gt 0) { " · max {0:N0} °C" -f $T::MaxCpuTemp } elseif ($T::UseCpu) { ' · température non surveillée' } else { '' })
+        $ui.TxtStressGpuT.Text = Format-Temp $s.GpuTemp
+        $ui.TxtStressGpuT.Foreground = Get-Brush $(if ($s.GpuTemp -ge 83) { '#FFEF4444' } elseif ($s.GpuTemp -ge 76) { '#FFF59E0B' } else { '#FF0F172A' })
+        $ui.TxtStressGpuSub.Text = if ($T::GpuStatus -like 'Erreur*') { $T::GpuStatus.Substring(9) } elseif ($s.GpuUsage -ge 0) { "utilisation {0:N0} %" -f $s.GpuUsage + $(if ($T::MaxGpuTemp -gt 0) { " · max {0:N0} °C" -f $T::MaxGpuTemp } else { '' }) } else { 'non suivie (NVIDIA uniquement)' }
+        $ui.TxtStressGpuW.Text = if ($s.GpuPower -ge 0) { "{0:N0} W" -f $s.GpuPower } else { '—' }
+        $ui.TxtStressGpuWSub.Text = if ($s.GpuPowerLimit -gt 0) { "limite {0:N0} W" -f $s.GpuPowerLimit + $(if ($T::MaxGpuPower -gt 0) { " · max {0:N0} W" -f $T::MaxGpuPower } else { '' }) } else { '' }
+        if ($T::UseRam) {
+            $ui.TxtStressRam.Text = if ($T::RamGB -gt 0) { "{0:N1} Go" -f $T::RamGB } else { '…' }
+            $ui.TxtStressRam.Foreground = Get-Brush $(if ($T::RamErrors -gt 0) { '#FFEF4444' } else { '#FF0F172A' })
+            $ui.TxtStressRamSub.Text = if ($T::RamStatus) { $T::RamStatus } else { "{0} vérification(s) · {1} erreur(s)" -f $T::RamPasses, $T::RamErrors }
+        } else { $ui.TxtStressRam.Text = '—'; $ui.TxtStressRamSub.Text = 'non testée' }
+        $window.UpdateLayout()
+        Draw-Chart $ui.ChartStressCpuT (ConvertTo-ChartValues ($T::History(0))) 100 '#FFEF4444' $T::CpuLimit
+        Draw-Chart $ui.ChartStressGpuT (ConvertTo-ChartValues ($T::History(1))) 100 '#FFF59E0B' $T::GpuLimit
+        $pl = if ($T::GpuPowerLimit -gt 0) { $T::GpuPowerLimit * 1.05 } else { 400 }
+        Draw-Chart $ui.ChartStressGpuW (ConvertTo-ChartValues ($T::History(2))) $pl '#FF8B5CF6' $(if ($T::GpuPowerLimit -gt 0) { $T::GpuPowerLimit } else { $null })
+    }
+
+    function Complete-StressTest {
+        $T = [PCDoctor.StressTest]
+        Set-StressRunningUi $false
+        $dur = Format-Duration ($T::StoppedAt - $T::Started)
+        $ui.BarStress.Value = 0
+        $ui.TxtStressTime.Text = ''
+        $lines = New-Object System.Collections.Generic.List[string]
+        $sev = 'ok'
+        switch ($T::StopReason) {
+            'cputemp' { $sev = 'bad'; $title = 'Arrêt automatique : processeur trop chaud'; $lines.Add(("Le processeur a atteint {0:N0} °C après {1}. Son refroidissement est insuffisant : vérifiez que le ventilateur du processeur tourne et que le ventirad est bien fixé, dépoussiérez, et refaites la pâte thermique si le PC a plusieurs années. Une surchauffe peut expliquer des coupures en jeu." -f $T::MaxCpuTemp, $dur)) }
+            'gputemp' { $sev = 'bad'; $title = 'Arrêt automatique : carte graphique trop chaude'; $lines.Add(("La carte graphique a atteint {0:N0} °C après {1}. Dépoussiérez-la, vérifiez que ses ventilateurs tournent et que le boîtier est bien ventilé." -f $T::MaxGpuTemp, $dur)) }
+            'gpudriver' { $sev = 'bad'; $title = 'Le pilote de la carte graphique a planté'; $lines.Add(("Windows a dû réinitialiser la carte graphique après {0}. Causes fréquentes : pilote abîmé (réinstallez-le proprement, page Pilotes), overclocking de la carte graphique, ou alimentation qui faiblit sous la charge." -f $dur)) }
+            'gpuerror' { $sev = 'warn'; $title = 'Test de la carte graphique impossible'; $lines.Add("La carte graphique n'a pas pu être testée : $($T::GpuStatus). Mettez à jour son pilote puis réessayez.") }
+            'user' { $sev = 'warn'; $title = "Test arrêté après $dur"; $lines.Add("Vous avez arrêté le test. Aucun problème n'a été détecté jusque-là.") }
+            default { $title = "Test réussi : $dur à pleine charge, sans problème"; $lines.Add("Ni coupure, ni surchauffe, ni erreur de mémoire pendant le test.") }
+        }
+        if ($T::UseRam) {
+            if ($T::RamErrors -gt 0) {
+                $sev = 'bad'
+                if ($T::StopReason -in @('time', 'user')) { $title = 'Erreurs de mémoire vive détectées' }
+                $lines.Add(("• Mémoire vive : {0} erreur(s) sur {1:N1} Go testés. La RAM ne garde pas correctement les données : c'est une cause classique de plantages et d'écrans bleus. Vérifiez que l'EXPO/XMP est désactivé dans le BIOS, réinstallez les barrettes, puis testez-les une par une (Diagnostic de mémoire Windows ou MemTest86)." -f $T::RamErrors, $T::RamGB))
+            } elseif ($T::RamPasses -gt 0) { $lines.Add(("• Mémoire vive : {0:N1} Go écrits et vérifiés {1} fois, aucune erreur." -f $T::RamGB, $T::RamPasses)) }
+            else { $lines.Add("• Mémoire vive : test trop court pour une vérification complète.") }
+        }
+        if ($T::UseCpu) {
+            $lines.Add($(if ($T::MaxCpuTemp -gt 0) { "• Processeur : {0:N0} °C au maximum{1}." -f $T::MaxCpuTemp, $(if ($T::MaxCpuTemp -ge 85) { ', c''est chaud : améliorer son refroidissement est conseillé' } else { ', température correcte' }) } else { "• Processeur : température non surveillée (lancez Core Temp avant le prochain test)." }))
+        }
+        if ($T::UseGpu -and $T::MaxGpuTemp -gt 0) {
+            $g = "• Carte graphique : {0:N0} °C au maximum" -f $T::MaxGpuTemp
+            if ($T::MaxGpuPower -gt 0 -and $T::GpuPowerLimit -gt 0) {
+                $g += ", {0:N0} W sur {1:N0} W ({2:N0} % de sa limite)" -f $T::MaxGpuPower, $T::GpuPowerLimit, (100 * $T::MaxGpuPower / $T::GpuPowerLimit)
+            }
+            $lines.Add($g + '.')
+            if ($T::StopReason -eq 'time' -and $T::GpuPowerLimit -gt 0 -and $T::MaxGpuPower -lt 0.75 * $T::GpuPowerLimit) { $lines.Add("  La carte graphique n'a pas atteint toute sa puissance pendant ce test : un jeu très exigeant peut la solliciter davantage.") }
+        }
+        $hard = 0
+        if ($script:LastData -and $script:LastData.Crashes) { $hard = @($script:LastData.Crashes | Where-Object { $_ -and $_.Category -eq 'Arrêt brutal' }).Count }
+        if ($sev -eq 'ok' -and $hard) {
+            $lines.Add("`nLe PC a tenu la pleine charge : une alimentation incapable de fournir la puissance demandée, ou un refroidissement insuffisant, aurait très probablement provoqué la coupure. Si les coupures continuent, elles viennent plutôt d'un pic bref en jeu, de la RAM ou d'un pilote : laissez la boîte noire tourner et analysez la prochaine coupure.")
+        }
+        $ui.TxtStressState.Text = if ($sev -eq 'ok') { 'Test terminé' } else { 'Test arrêté' }
+        $ui.TxtStressResultTitle.Text = $title
+        $ui.StressResultDot.Fill = Get-Brush $(switch ($sev) { 'ok' { '#FF22C55E' } 'warn' { '#FFF59E0B' } default { '#FFEF4444' } })
+        $ui.TxtStressResult.Text = ($lines -join "`n")
+        $ui.StressResult.Visibility = 'Visible'
+        $ui.StressResult.BringIntoView()
+        Set-Status $title
+    }
+
+    $ui.BtnStressStart.Add_Click({ try { Start-StressTest } catch { Write-Log "Test : $_ $($_.ScriptStackTrace)"; Set-Status "Impossible de lancer le test : $_"; Set-StressRunningUi $false } })
+    $ui.BtnStressStop.Add_Click({ [PCDoctor.StressTest]::Stop('user'); $ui.TxtStressState.Text = 'Arrêt en cours…'; $ui.BtnStressStop.IsEnabled = $false })
+    $ui.BtnStressCoreTemp.Add_Click({
+            if ([PCDoctor.LiveSensors]::CoreTempInstalled()) {
+                try { Start-Process -FilePath ([PCDoctor.LiveSensors]::CoreTempPath()); Set-Status 'Core Temp lancé : la température du processeur sera surveillée pendant le test.' } catch { Set-Status "Impossible de lancer Core Temp : $_" }
+            } else { Start-Process 'https://www.alcpu.com/CoreTemp/' }
+            $script:BbRefreshAt = [DateTime]::Now.AddSeconds(4)
+        })
+    $ui.BtnStressSolutions.Add_Click({ Show-Page 'solutions' })
+    $ui.BtnStressResultBb.Add_Click({
+            $T = [PCDoctor.StressTest]
+            $m = [int][math]::Min(15, [math]::Ceiling(($T::StoppedAt - $T::Started).TotalMinutes) + 1)
+            Show-Page 'blackbox'
+            try { Show-BlackBoxWindow $T::StoppedAt $m $false } catch { Set-Status "Boîte noire : $_" }
+        })
+    $ui.BtnStressCrashBb.Add_Click({
+            Show-Page 'blackbox'
+            if ($script:StressCrashTime) { try { Show-BlackBoxWindow $script:StressCrashTime.AddSeconds(8) 5 $true } catch { Set-Status "Boîte noire : $_" } }
         })
 
     # Alertes
@@ -5172,7 +5720,15 @@ Read-Host 'Appuyez sur Entree pour fermer'
             Start-FullAnalysis
             if ((Get-Settings)['CheckUpdates'] -ne '0') { Start-UpdateCheck $false }
         })
-    $window.Add_Closing({ [PCDoctor.DiskScanner]::Cancel = $true; $script:Timer.Stop() })
+    $window.Add_Closing({
+            [PCDoctor.DiskScanner]::Cancel = $true; $script:Timer.Stop()
+            if ([PCDoctor.StressTest]::Running) {
+                [PCDoctor.StressTest]::Stop('user')
+                $w = 0; while ([PCDoctor.StressTest]::Running -and $w -lt 20) { Start-Sleep -Milliseconds 200; $w++ }
+                Remove-Item -LiteralPath $script:StressMarker -Force -ErrorAction SilentlyContinue
+            }
+        })
+    try { if (Test-StressCrash) { Show-Page 'stress'; Set-Status 'Le PC s''est coupé pendant le dernier test de stabilité : le problème est reproduit.' } } catch { Write-Log "Test : $_" }
 
     $script:Timer.Start()
     [void]$window.ShowDialog()
