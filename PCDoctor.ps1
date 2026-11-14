@@ -1047,7 +1047,7 @@ if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp
 # ---------------------------------------------------------------------------
 #  Réglages partagés (appli + boîte noire) : %LOCALAPPDATA%\PCDoctor\settings.ini
 # ---------------------------------------------------------------------------
-$script:AppVersion = '2.5.0'
+$script:AppVersion = '2.6.0'
 $script:Repo = 'doninj/pc-doctor'
 $script:SettingsFile = Join-Path $script:LogDir 'settings.ini'
 $script:BlackBoxDir = Join-Path $script:LogDir 'boite-noire'
@@ -2134,6 +2134,181 @@ function Get-WingetUpgrades {
     $rows
 }
 
+# Sécurité du PC : uniquement de la lecture (aucun réglage n'est modifié ici)
+function Get-SecurityStatus {
+    $list = New-Object System.Collections.Generic.List[object]
+    $order = @{ 'Critique' = 0; 'Attention' = 1; 'Info' = 2; 'OK' = 3 }
+    $add = { param($sev, $title, $advice, $actLabel, $actId) $list.Add([pscustomobject]@{ Severity = $sev; Title = $title; Advice = $advice; Order = $order[$sev]; ActionLabel = $actLabel; ActionId = $actId }) }
+    $reg = { param($path, $name) try { (Get-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop).$name } catch { $null } }
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $facts = [ordered]@{ Antivirus = '?'; Firewall = '?'; Updates = '?'; Hardware = '?' }
+
+    # --- Antivirus ---
+    $mp = $null; try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
+    $avs = @(); try { $avs = @(Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop) } catch {}
+    $third = @($avs | Where-Object { $_.displayName -notmatch 'Windows Defender|Microsoft Defender' -and ([int64]$_.productState -band 0x1000) })
+    $defOn = $mp -and $mp.RealTimeProtectionEnabled -and $mp.AMRunningMode -ne 'Passive Mode'
+    if ($third.Count) {
+        $a = $third[0]
+        $facts.Antivirus = $a.displayName
+        if ([int64]$a.productState -band 0x10) { & $add 'Attention' "Antivirus « $($a.displayName) » pas à jour" "Ses définitions de virus sont anciennes : ouvrez-le et lancez sa mise à jour." $null $null }
+        else { & $add 'OK' "Antivirus actif : $($a.displayName)" "Protection en temps réel activée et à jour (Microsoft Defender se met en retrait, c'est normal)." $null $null }
+    } elseif ($defOn) {
+        $facts.Antivirus = 'Microsoft Defender'
+        $age = [int]$mp.AntivirusSignatureAge
+        if ($age -ge 4) { & $add 'Attention' "Définitions de virus anciennes ($age jours)" "Microsoft Defender ne connaît pas les menaces les plus récentes. Lancez la mise à jour de la protection (ou Windows Update)." 'Mettre à jour' 'windowsdefender://threat' }
+        else { & $add 'OK' 'Antivirus actif : Microsoft Defender' ("Protection en temps réel activée, définitions à jour (" + $(if ($age -lt 1) { "mises à jour aujourd'hui" } else { "il y a $age jour(s)" }) + ").") $null $null }
+        if ($mp.PSObject.Properties['IsTamperProtected'] -and -not $mp.IsTamperProtected) { & $add 'Attention' 'Protection contre les falsifications désactivée' "Elle empêche un programme malveillant de couper l'antivirus. Réactivez-la dans Sécurité Windows > Protection contre les virus > Gérer les paramètres." 'Ouvrir' 'windowsdefender://threatsettings' }
+        $scan = [int]$mp.QuickScanAge
+        if ($scan -gt 14 -and $scan -lt 10000) { & $add 'Info' "Dernière analyse antivirus il y a $scan jours" "La protection en temps réel surveille déjà tout ; une analyse rapide de temps en temps vérifie ce qui est déjà sur le disque." 'Analyse rapide' 'sec-quickscan' }
+    } else {
+        $facts.Antivirus = 'Aucun'
+        & $add 'Critique' 'Aucun antivirus actif' "Ni Microsoft Defender ni un autre antivirus ne protège le PC en temps réel. Réactivez la protection en temps réel dans Sécurité Windows." 'Activer' 'windowsdefender://threatsettings'
+    }
+    if ($mp) {
+        try {
+            $since = (Get-Date).AddDays(-30)
+            $det = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object { $_.InitialDetectionTime -ge $since })
+            if ($det.Count) {
+                $names = @()
+                try { $th = @(Get-MpThreat -ErrorAction Stop); $names = @($det | ForEach-Object { $id = $_.ThreatID; ($th | Where-Object { $_.ThreatID -eq $id } | Select-Object -First 1).ThreatName } | Where-Object { $_ } | Select-Object -Unique -First 3) } catch {}
+                & $add 'Attention' "$($det.Count) menace(s) détectée(s) ces 30 derniers jours" ("Microsoft Defender a bloqué ou mis en quarantaine : " + $(if ($names.Count) { $names -join ', ' } else { 'voir l''historique' }) + ". Vérifiez dans l'historique qu'elles ont bien été traitées.") 'Historique' 'windowsdefender://history'
+            }
+        } catch {}
+        if ($defOn) {
+            try {
+                $pref = Get-MpPreference -ErrorAction Stop
+                $ex = @(@($pref.ExclusionPath) + @($pref.ExclusionProcess) | Where-Object { $_ -and $_ -notlike 'N/A*' })
+                if ($ex.Count) { & $add 'Info' "$($ex.Count) exclusion(s) dans l'antivirus" ("Ces éléments ne sont pas analysés : " + (($ex | Select-Object -First 4) -join ' ; ') + ". Un logiciel malveillant peut en ajouter pour se cacher : vérifiez que vous les reconnaissez.") 'Voir' 'windowsdefender://threatsettings' }
+                if ($pref.PUAProtection -eq 0) { & $add 'Info' 'Blocage des applications indésirables désactivé' "Il bloque les logiciels publicitaires et les barres d'outils installés en douce avec d'autres programmes. Activez « Blocage d'applications potentiellement indésirables »." 'Activer' 'windowsdefender://appbrowser' }
+            } catch {}
+        }
+    }
+
+    # --- Pare-feu ---
+    try {
+        $off = @(Get-NetFirewallProfile -ErrorAction Stop | Where-Object { -not $_.Enabled } | ForEach-Object { @{ Domain = 'domaine'; Private = 'privé'; Public = 'public' }[[string]$_.Name] })
+        $fw3 = @(); try { $fw3 = @(Get-CimInstance -Namespace root\SecurityCenter2 -ClassName FirewallProduct -ErrorAction Stop | Where-Object { [int64]$_.productState -band 0x1000 }) } catch {}
+        if (-not $off.Count) { $facts.Firewall = 'Actif'; & $add 'OK' 'Pare-feu Windows actif' 'Les connexions entrantes non autorisées sont bloquées sur tous les réseaux.' $null $null }
+        elseif ($fw3.Count) { $facts.Firewall = $fw3[0].displayName; & $add 'OK' "Pare-feu actif : $($fw3[0].displayName)" 'Un pare-feu tiers remplace celui de Windows.' $null $null }
+        else { $facts.Firewall = 'Désactivé'; & $add 'Critique' "Pare-feu désactivé (réseau $($off -join ', '))" "Le PC accepte des connexions qu'il devrait bloquer, dangereux surtout sur un Wi-Fi public. Réactivez-le dans Sécurité Windows." 'Activer' 'windowsdefender://network' }
+    } catch {}
+
+    # --- Windows et mises à jour ---
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $build = [int]$os.BuildNumber
+        if ($os.Caption -match 'Windows 10') { & $add 'Critique' "Windows 10 n'est plus mis à jour" "Microsoft ne publie plus de correctifs de sécurité pour Windows 10 depuis le 14 octobre 2025. Passez à Windows 11 (gratuit si le PC est compatible)." 'Windows Update' 'ms-settings:windowsupdate' }
+        elseif ($build -lt 26100) { & $add 'Attention' "Version de Windows 11 qui n'est plus prise en charge (build $build)" "Elle ne reçoit plus de correctifs de sécurité : installez la dernière version via Windows Update." 'Windows Update' 'ms-settings:windowsupdate' }
+        elseif ($build -lt 26200) { & $add 'Attention' 'Windows 11 24H2 : fin de prise en charge en octobre 2026' "Installez la version 25H2 via Windows Update (mise à jour rapide) pour continuer à recevoir les correctifs." 'Windows Update' 'ms-settings:windowsupdate' }
+    } catch {}
+    $lastWu = $null
+    try {
+        $sess = New-Object -ComObject Microsoft.Update.Session
+        $srch = $sess.CreateUpdateSearcher()
+        $n = $srch.GetTotalHistoryCount()
+        if ($n -gt 0) { $lastWu = @($srch.QueryHistory(0, [math]::Min($n, 60)) | Where-Object { $_.ResultCode -eq 2 -and $_.Operation -eq 1 } | Sort-Object Date -Descending | Select-Object -First 1).Date }
+    } catch {}
+    if (-not $lastWu) { try { $lastWu = (Get-HotFix -ErrorAction Stop | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending | Select-Object -First 1).InstalledOn } catch {} }
+    if ($lastWu) {
+        $lastWu = $lastWu.ToLocalTime()
+        $days = [int]((Get-Date) - $lastWu).TotalDays
+        $facts.Updates = if ($days -le 1) { "aujourd'hui" } else { "il y a $days jours" }
+        if ($days -gt 90) { & $add 'Critique' "Aucune mise à jour Windows depuis $days jours" 'Le PC manque des correctifs de sécurité importants. Ouvrez Windows Update et installez tout.' 'Windows Update' 'ms-settings:windowsupdate' }
+        elseif ($days -gt 40) { & $add 'Attention' "Dernière mise à jour Windows il y a $days jours" "Microsoft publie des correctifs chaque mois : vérifiez que Windows Update n'est pas en pause ou bloqué." 'Windows Update' 'ms-settings:windowsupdate' }
+        else { & $add 'OK' 'Windows à jour' ("Dernière mise à jour installée le {0:dd/MM/yyyy}." -f $lastWu) $null $null }
+    }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { & $add 'Info' 'Redémarrage nécessaire' 'Des mises à jour attendent un redémarrage pour être appliquées : elles ne protègent pas le PC tant que ce n''est pas fait.' 'Windows Update' 'ms-settings:windowsupdate' }
+
+    # --- Contrôle de compte (UAC) et SmartScreen ---
+    $lua = & $reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'EnableLUA'
+    $cpa = & $reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'ConsentPromptBehaviorAdmin'
+    if ($lua -eq 0) { & $add 'Critique' 'Contrôle de compte d''utilisateur (UAC) désactivé' "N'importe quel programme peut modifier Windows sans rien demander. Remettez le curseur sur le niveau par défaut (redémarrage nécessaire)." 'Régler' 'uac' }
+    elseif ($cpa -eq 0) { & $add 'Attention' 'UAC réglé sur « Ne jamais m''avertir »' "Les programmes obtiennent les droits administrateur sans confirmation. Remettez le curseur sur le niveau par défaut." 'Régler' 'uac' }
+    else { & $add 'OK' 'Contrôle de compte d''utilisateur actif' 'Windows demande confirmation avant qu''un programme modifie le système.' $null $null }
+    $ss = & $reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'SmartScreenEnabled'
+    $ssPol = & $reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableSmartScreen'
+    if ($ss -eq 'Off' -or $ssPol -eq 0) { & $add 'Attention' 'SmartScreen désactivé' 'Il prévient avant de lancer un programme téléchargé inconnu ou dangereux. Réactivez « Vérifier les applications et les fichiers ».' 'Activer' 'windowsdefender://appbrowser' }
+
+    # --- Matériel : Secure Boot, TPM, intégrité de la mémoire, chiffrement ---
+    $hw = @()
+    $sb = & $reg 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled'
+    if ($sb -eq 1) { $hw += 'Secure Boot' }
+    elseif ($null -ne $sb) { & $add 'Attention' 'Secure Boot désactivé' "Il empêche un virus de se lancer avant Windows, et certains jeux (anti-triche) l'exigent. Activez-le dans le BIOS (section Boot > Secure Boot, mode « Windows UEFI »)." $null $null }
+    else { & $add 'Info' 'Démarrage en mode BIOS ancien (pas UEFI)' 'Secure Boot n''est pas disponible dans ce mode.' $null $null }
+    $tpm = $null
+    try { $tpm = Get-CimInstance Win32_PnPEntity -Filter "PNPClass='SecurityDevices'" -ErrorAction Stop | Where-Object { $_.Service -eq 'TPM' -or $_.Name -match 'Trusted Platform|TPM|plateforme sécurisée' } | Select-Object -First 1 } catch {}
+    if ($tpm -and $tpm.Status -eq 'OK') { $hw += $(if ($tpm.Name -match '2\.0') { 'TPM 2.0' } else { 'TPM' }) }
+    else { & $add 'Attention' 'Puce de sécurité TPM non détectée' "Windows 11 et le chiffrement en ont besoin. Sur les cartes mères AMD, activez « fTPM » (ou « AMD CPU fTPM ») dans le BIOS." $null $null }
+    $hvci = & $reg 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' 'Enabled'
+    if ($hvci -eq 1) { $hw += 'intégrité de la mémoire' }
+    else { & $add 'Info' 'Intégrité de la mémoire désactivée' "Elle empêche un pilote malveillant de s'installer au cœur de Windows. Coût en jeu : très faible sur un processeur récent. Si Windows refuse de l'activer, un ancien pilote incompatible est en cause." 'Ouvrir' 'windowsdefender://coreisolation' }
+    $bl = $null
+    if ($isAdmin) { try { $bl = (Get-CimInstance -Namespace root\cimv2\Security\MicrosoftVolumeEncryption -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'" -ErrorAction Stop).ProtectionStatus } catch {} }
+    else { try { $bl = (New-Object -ComObject Shell.Application).NameSpace(17).ParseName("$env:SystemDrive\").ExtendedProperty('System.Volume.BitLockerProtection') } catch {} }
+    if ($bl -eq 1) { $hw += 'disque chiffré' }
+    elseif ($null -ne $bl) { & $add 'Info' "Disque $env:SystemDrive non chiffré" "Le chiffrement (BitLocker ou « Chiffrement de l'appareil ») protège vos fichiers si le PC est volé. Surtout utile pour un portable ; gardez bien la clé de récupération." $null $null }
+    $facts.Hardware = if ($hw.Count) { $hw -join ' · ' } else { '—' }
+
+    # --- Accès à distance et réseau ---
+    if ((& $reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections') -eq 0) { & $add 'Attention' 'Bureau à distance activé' "Le PC accepte les connexions à distance. Si vous ne vous en servez pas, désactivez-le : c'est une porte d'entrée souvent attaquée." 'Désactiver' 'ms-settings:remotedesktop' }
+    $smb1 = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\mrxsmb10' -ErrorAction SilentlyContinue
+    if (($smb1 -and $smb1.Start -ne 4) -or (& $reg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'SMB1') -eq 1) { & $add 'Attention' 'Ancien partage de fichiers SMB 1.0 installé' "Ce protocole obsolète a été utilisé par le rançongiciel WannaCry. Désinstallez « Support de partage de fichiers SMB 1.0/CIFS » dans les fonctionnalités de Windows." 'Fonctionnalités' 'optionalfeatures' }
+    $remote = @{ 'AnyDesk' = 'AnyDesk'; 'TeamViewer' = 'TeamViewer'; 'rustdesk' = 'RustDesk'; 'UltraViewer' = 'UltraViewer'; 'ScreenConnect' = 'ScreenConnect'; 'Splashtop' = 'Splashtop'; 'SRService' = 'Splashtop'; 'AteraAgent' = 'Atera'; 'LogMeIn' = 'LogMeIn'; 'Supremo' = 'Supremo'; 'ToDesk' = 'ToDesk'; 'AweSun' = 'AweSun'; 'AA_v3' = 'Ammyy Admin'; 'RemotePC' = 'RemotePC'; 'QuickAssist' = 'Assistance rapide' }
+    $found = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $n = $_.ProcessName; foreach ($k in $remote.Keys) { if ($n -like "$k*") { $remote[$k] } } } | Select-Object -Unique)
+    if ($found.Count) { & $add 'Attention' ("Logiciel de prise de contrôle à distance ouvert : " + ($found -join ', ')) "Si c'est vous qui l'utilisez, tout va bien. Sinon, fermez-le et désinstallez-le : les arnaqueurs au « faux support technique » s'en servent pour prendre la main sur le PC." 'Applications' 'ms-settings:appsfeatures' }
+    $pe = & $reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' 'ProxyEnable'
+    $pac = & $reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' 'AutoConfigURL'
+    if ($pe -eq 1 -or $pac) {
+        $srv = if ($pac) { $pac } else { & $reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' 'ProxyServer' }
+        & $add 'Attention' "Proxy configuré : $srv" "Tout le trafic web passe par ce serveur. Si vous ne l'avez pas mis en place (VPN, entreprise), un logiciel malveillant peut s'en servir pour espionner votre navigation." 'Paramètres' 'ms-settings:network-proxy'
+    }
+    # Fichier hosts : on ignore les sites de développement locaux, le réseau local et Tailscale.
+    # Restent : les sites envoyés vers un serveur extérieur, et les sites de sécurité bloqués.
+    try {
+        $hosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+        $known = 'microsoft|windowsupdate|windows\.com|norton|avast|avg\.com|kaspersky|eset|bitdefender|malwarebytes|mcafee|avira|virustotal|google|paypal|apple\.com|steampowered|epicgames'
+        $redir = New-Object System.Collections.Generic.List[object]; $blocked = New-Object System.Collections.Generic.List[string]
+        foreach ($line in @(Get-Content -LiteralPath $hosts -ErrorAction Stop)) {
+            $p = @(($line -replace '#.*$', '').Trim() -split '\s+' | Where-Object { $_ })
+            if ($p.Count -lt 2) { continue }
+            $ip = $p[0]
+            foreach ($h in $p[1..($p.Count - 1)]) {
+                if ($h -match '^(localhost|localhost\.localdomain|ip6-\w+)$' -or $h -match '\.(test|local|localhost|lan|internal|home\.arpa|ts\.net\.?)$' -or $h -notmatch '\.') { continue }
+                if ($ip -match '^(127\.|0\.0\.0\.0$|::1?$|::$)') { if ($h -match $known) { $blocked.Add($h) } }
+                elseif ($ip -notmatch '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|169\.254\.|f[cd]|fe80)') { $redir.Add([pscustomobject]@{ Host = $h; Ip = $ip }) }
+            }
+        }
+        if ($blocked.Count) { & $add 'Attention' "$($blocked.Count) site(s) de sécurité ou connus bloqués dans le fichier hosts" ("Bloqués : " + (($blocked | Select-Object -First 4) -join ', ') + ". Un virus fait souvent ça pour empêcher l'antivirus ou Windows de se mettre à jour. Si vous ne l'avez pas fait vous-même, supprimez ces lignes.") 'Ouvrir le dossier' 'sec-hosts' }
+        if ($redir.Count) {
+            $ips = @($redir | Group-Object Ip | Sort-Object Count -Descending | ForEach-Object { $_.Name })
+            & $add 'Attention' "$($redir.Count) site(s) redirigé(s) vers un serveur extérieur (fichier hosts)" ("Par exemple " + (($redir | Select-Object -First 3 | ForEach-Object { $_.Host }) -join ', ') + " → " + ($ips -join ', ') + ". Ces adresses n'arrivent pas sur le vrai site mais sur ce serveur. Si vous n'avez pas ajouté ces lignes vous-même (ou avec un outil de confiance), un logiciel a pu le faire pour vous envoyer vers de faux sites. Pour simplement bloquer un site, on utilise 0.0.0.0.") 'Ouvrir le dossier' 'sec-hosts' }
+    } catch {}
+
+    # --- Comptes ---
+    try {
+        foreach ($u in @(Get-LocalUser -ErrorAction Stop | Where-Object { $_.Enabled })) {
+            $sid = [string]$u.SID
+            if ($sid -match '-500$') { & $add 'Attention' "Compte Administrateur intégré activé (« $($u.Name) »)" "Ce compte caché a tous les droits sans confirmation UAC. Désactivez-le si vous ne vous en servez pas." 'Désactiver' "sec-disable-user:$($u.Name)" }
+            elseif ($sid -match '-501$') { & $add 'Attention' "Compte Invité activé (« $($u.Name) »)" "N'importe qui peut ouvrir une session sans mot de passe. Désactivez-le." 'Désactiver' "sec-disable-user:$($u.Name)" }
+        }
+    } catch {}
+
+    # --- Programmes au démarrage sans signature numérique ---
+    try {
+        $uns = New-Object System.Collections.Generic.List[string]
+        foreach ($it in @(Get-StartupItems | Where-Object { $_.Enabled -and $_.Kind -ne 'uwp' })) {
+            $exe = Get-ExePath $it.Command
+            if (-not $exe -or -not (Test-Path -LiteralPath $exe) -or $exe -match 'PC Doctor') { continue }
+            $sig = Get-AuthenticodeSignature -LiteralPath $exe -ErrorAction SilentlyContinue
+            if ($sig -and $sig.Status -ne 'Valid') { $uns.Add($it.DisplayName) }
+        }
+        if ($uns.Count) { & $add 'Info' "$($uns.Count) programme(s) au démarrage sans signature numérique" ((($uns | Select-Object -First 4) -join ', ') + ". Pas forcément dangereux (petits logiciels gratuits), mais vérifiez que vous les connaissez ; sinon, désactivez-les.") 'Démarrage' 'goto:startup' }
+    } catch {}
+
+    [pscustomobject]@{ Items = @($list | Sort-Object Order); Facts = [pscustomobject]$facts; IsAdmin = $isAdmin }
+}
+
 function Get-CleanableItems {
     $L = $env:LOCALAPPDATA
     $downloads = Join-Path $env:USERPROFILE 'Downloads'
@@ -2849,6 +3024,12 @@ $xamlText = @'
           </ListBoxItem>
           <ListBoxItem>
             <DockPanel>
+              <Border x:Name="BadgeSecurity" Style="{StaticResource Badge}" Background="#FFF59E0B" DockPanel.Dock="Right"><TextBlock x:Name="BadgeSecurityText" Style="{StaticResource BadgeText}"/></Border>
+              <TextBlock Style="{StaticResource NavIcon}" Text="&#xE72E;"/><TextBlock Style="{StaticResource NavText}" Text="Sécurité"/>
+            </DockPanel>
+          </ListBoxItem>
+          <ListBoxItem>
+            <DockPanel>
               <Border x:Name="BadgeDrivers" Style="{StaticResource Badge}" Background="#FFF59E0B" DockPanel.Dock="Right"><TextBlock x:Name="BadgeDriversText" Style="{StaticResource BadgeText}"/></Border>
               <TextBlock Style="{StaticResource NavIcon}" Text="&#xE772;"/><TextBlock Style="{StaticResource NavText}" Text="Pilotes"/>
             </DockPanel>
@@ -3364,8 +3545,103 @@ $xamlText = @'
           </ScrollViewer>
         </TabItem>
 
-        <!-- PILOTES -->
+        <!-- SÉCURITÉ -->
         <TabItem>
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="SecurityRoot" Margin="32,28,32,24">
+              <TextBlock Style="{StaticResource PageTitle}" Text="Sécurité"/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Antivirus, pare-feu, mises à jour et réglages de Windows qui protègent le PC. PC Doctor ne fait que vérifier : rien n'est modifié sans votre accord."/>
+              <Grid Margin="0,18,0,24">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="300"/>
+                  <ColumnDefinition Width="16"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Border Style="{StaticResource Card}">
+                  <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <Grid Width="130" Height="130" HorizontalAlignment="Center">
+                      <Ellipse Width="114" Height="114" Stroke="#FFEDF1F7" StrokeThickness="11"/>
+                      <Canvas Width="130" Height="130">
+                        <Path x:Name="SecScoreArc" Stroke="#FF3B6EF5" StrokeThickness="11" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                      </Canvas>
+                      <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+                        <TextBlock x:Name="SecScoreText" Text="…" FontSize="36" FontWeight="Bold" HorizontalAlignment="Center" FontFamily="Segoe UI Variable Display, Segoe UI"/>
+                        <TextBlock Text="sur 100" Style="{StaticResource MutedText}" FontSize="11" HorizontalAlignment="Center" Margin="0,-4,0,0"/>
+                      </StackPanel>
+                    </Grid>
+                    <TextBlock x:Name="SecScoreLabel" Text="Vérification…" FontSize="16" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,12,0,2"/>
+                    <TextBlock x:Name="SecScoreSub" Style="{StaticResource MutedText}" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Border>
+                <Border Grid.Column="2" Style="{StaticResource Card}">
+                  <StackPanel>
+                    <TextBlock Text="Protection" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                      <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+                      <TextBlock Text="Antivirus" Style="{StaticResource MutedText}" Margin="0,0,0,8"/>
+                      <TextBlock x:Name="TxtSecAv" Grid.Column="1" Text="…" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                      <TextBlock Grid.Row="1" Text="Pare-feu" Style="{StaticResource MutedText}" Margin="0,0,0,8"/>
+                      <TextBlock x:Name="TxtSecFw" Grid.Row="1" Grid.Column="1" Text="…" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                      <TextBlock Grid.Row="2" Text="Mises à jour" Style="{StaticResource MutedText}" Margin="0,0,0,8"/>
+                      <TextBlock x:Name="TxtSecWu" Grid.Row="2" Grid.Column="1" Text="…" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                      <TextBlock Grid.Row="3" Text="Protections matérielles" Style="{StaticResource MutedText}"/>
+                      <TextBlock x:Name="TxtSecHw" Grid.Row="3" Grid.Column="1" Text="…" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                    </Grid>
+                    <WrapPanel Margin="0,16,0,0">
+                      <Button x:Name="BtnSecRefresh" Margin="0,0,8,6">
+                        <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE72C;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Vérifier à nouveau"/></StackPanel>
+                      </Button>
+                      <Button x:Name="BtnSecScan" Content="Analyse antivirus rapide" Style="{StaticResource Secondary}" Margin="0,0,8,6"/>
+                      <Button x:Name="BtnSecOpen" Content="Ouvrir Sécurité Windows" Style="{StaticResource Secondary}" Margin="0,0,8,6"/>
+                    </WrapPanel>
+                    <TextBlock x:Name="TxtSecNote" Style="{StaticResource MutedText}" FontSize="12" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                  </StackPanel>
+                </Border>
+              </Grid>
+              <TextBlock Style="{StaticResource Section}" Text="Points vérifiés"/>
+              <ItemsControl x:Name="ListSecurity">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <Border x:Name="Bd" Style="{StaticResource Card}" Margin="0,0,0,10" Padding="16,14">
+                      <DockPanel>
+                        <Border x:Name="IconBg" Width="38" Height="38" CornerRadius="19" Background="#FFEFF4FF" DockPanel.Dock="Left" VerticalAlignment="Top" Margin="0,0,14,0">
+                          <TextBlock x:Name="Icon" Text="&#xE946;" FontFamily="{StaticResource Icons}" FontSize="17" Foreground="#FF3B6EF5" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <Button x:Name="Act" DockPanel.Dock="Right" Style="{StaticResource Small}" Content="{Binding ActionLabel, Mode=OneWay}" Tag="{Binding ActionId, Mode=OneWay}" VerticalAlignment="Center" Margin="14,0,0,0"/>
+                        <StackPanel VerticalAlignment="Center">
+                          <TextBlock Text="{Binding Title, Mode=OneWay}" FontWeight="SemiBold" FontSize="14.5" TextWrapping="Wrap"/>
+                          <TextBlock Text="{Binding Advice, Mode=OneWay}" TextWrapping="Wrap" Margin="0,3,0,0" Foreground="#FF475569"/>
+                        </StackPanel>
+                      </DockPanel>
+                    </Border>
+                    <DataTemplate.Triggers>
+                      <DataTrigger Binding="{Binding ActionLabel}" Value="{x:Null}"><Setter TargetName="Act" Property="Visibility" Value="Collapsed"/></DataTrigger>
+                      <DataTrigger Binding="{Binding Severity}" Value="Critique">
+                        <Setter TargetName="IconBg" Property="Background" Value="#FFFEECEC"/>
+                        <Setter TargetName="Icon" Property="Foreground" Value="#FFEF4444"/>
+                        <Setter TargetName="Icon" Property="Text" Value="&#xEA39;"/>
+                        <Setter TargetName="Bd" Property="BorderBrush" Value="#FFFBCACA"/>
+                      </DataTrigger>
+                      <DataTrigger Binding="{Binding Severity}" Value="Attention">
+                        <Setter TargetName="IconBg" Property="Background" Value="#FFFFF4E0"/>
+                        <Setter TargetName="Icon" Property="Foreground" Value="#FFF59E0B"/>
+                        <Setter TargetName="Icon" Property="Text" Value="&#xE7BA;"/>
+                      </DataTrigger>
+                      <DataTrigger Binding="{Binding Severity}" Value="OK">
+                        <Setter TargetName="IconBg" Property="Background" Value="#FFE7F8EE"/>
+                        <Setter TargetName="Icon" Property="Foreground" Value="#FF22C55E"/>
+                        <Setter TargetName="Icon" Property="Text" Value="&#xE73E;"/>
+                      </DataTrigger>
+                    </DataTemplate.Triggers>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </StackPanel>
+          </ScrollViewer>
+        </TabItem>
+
+        <!-- PILOTES -->        <TabItem>
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="DriversRoot" Margin="32,28,32,24">
               <TextBlock Style="{StaticResource PageTitle}" Text="Pilotes"/>
@@ -4271,7 +4547,7 @@ try {
 
     function Set-Status([string]$t) { $script:ui.TxtStatus.Text = $t }
 
-    $script:Pages = @{ diag = 0; solutions = 1; blackbox = 2; stress = 3; drivers = 4; software = 5; perf = 6; network = 7; startup = 8; procs = 9; crashes = 10; disk = 11; clean = 12; settings = 13 }
+    $script:Pages = @{ diag = 0; solutions = 1; blackbox = 2; stress = 3; security = 4; drivers = 5; software = 6; perf = 7; network = 8; startup = 9; procs = 10; crashes = 11; disk = 12; clean = 13; settings = 14 }
     function Show-Page([string]$name) { if ($script:Pages.ContainsKey($name)) { $ui.NavList.SelectedIndex = $script:Pages[$name] } }
     $script:DriversLoaded = $false
     $script:SoftwareLoaded = $false
@@ -4283,6 +4559,7 @@ try {
                 if ($i -eq $script:Pages['drivers'] -and -not $script:DriversLoaded) { Load-Drivers }
                 if ($i -eq $script:Pages['software'] -and -not $script:SoftwareLoaded) { Start-SoftwareSearch }
                 if ($i -eq $script:Pages['blackbox']) { Update-BlackBoxStatus; Show-BlackBoxCrashes }
+                if ($i -eq $script:Pages['security'] -and -not $script:SecurityLoaded) { Load-Security }
             } catch { Write-Log "Navigation : $_ $($_.ScriptStackTrace)" }
         })
     $ui.NavList.SelectedIndex = 0
@@ -4342,6 +4619,8 @@ if (`$h -ne '$hash') { Add-Type -AssemblyName PresentationFramework; [void][Syst
         if ($id -like 'goto:*') { Show-Page $id.Substring(5); return }
         if ($id -like 'url:*') { Start-Process $id.Substring(4); return }
         if ($id -like 'ms-settings:*') { Start-Process $id; return }
+        if ($id -like 'windowsdefender:*') { Start-Process $id; return }
+        if ($id -like 'sec-disable-user:*') { Disable-LocalAccount $id.Substring(17); return }
         if ($id -like 'gpu-pl:*') { Set-GpuPowerLimit ([int]$id.Substring(7)); return }
         if ($id -like 'power:*') { Set-PowerPlan $id.Substring(6); return }
         switch ($id) {
@@ -4352,6 +4631,10 @@ if (`$h -ne '$hash') { Add-Type -AssemblyName PresentationFramework; [void][Syst
             'fastboot-off' { Set-FastStartup $false }
             'fastboot-on' { Set-FastStartup $true }
             'widget-open' { Open-Widget }
+            'uac' { Start-Process (Get-SysExe 'UserAccountControlSettings.exe') }
+            'optionalfeatures' { Start-Process (Get-SysExe 'OptionalFeatures.exe') }
+            'sec-hosts' { Start-Process (Join-Path $env:windir 'explorer.exe') -ArgumentList ('/select,"{0}"' -f (Join-Path $script:Sys32 'drivers\etc\hosts')) }
+            'sec-quickscan' { Start-QuickScan }
             'bb-start' {
                 Start-BlackBox
                 Set-BlackBoxAutostart $true
@@ -4384,6 +4667,7 @@ if (`$h -ne '$hash') { Add-Type -AssemblyName PresentationFramework; [void][Syst
     $ui.ListFindings.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
     $ui.ListSolutions.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
     $ui.DriversRoot.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
+    $ui.ListSecurity.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
     $ui.PerfRoot.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
 
     function Refresh-Solutions {
@@ -5470,6 +5754,71 @@ Read-Host 'Appuyez sur Entree pour fermer'
             if ($script:StressCrashTime) { try { Show-BlackBoxWindow $script:StressCrashTime.AddSeconds(8) 5 $true } catch { Set-Status "Boîte noire : $_" } }
         })
 
+    # =====================================================================
+    #  Sécurité
+    # =====================================================================
+    $script:SecurityLoaded = $false
+    function Set-SecScore([int]$score) {
+        $angle = [math]::Min(359.9, [math]::Max(0.5, 3.6 * $score))
+        $r = 57.0; $cx = 65.0; $cy = 65.0; $rad = $angle * [math]::PI / 180
+        $inv = [Globalization.CultureInfo]::InvariantCulture
+        $ui.SecScoreArc.Data = [System.Windows.Media.Geometry]::Parse([string]::Format($inv, 'M {0},{1} A {2},{2} 0 {3} 1 {4},{5}', $cx, ($cy - $r), $r, $(if ($angle -gt 180) { 1 } else { 0 }), ($cx + $r * [math]::Sin($rad)), ($cy - $r * [math]::Cos($rad))))
+        $color = if ($score -ge 85) { '#FF22C55E' } elseif ($score -ge 60) { '#FFF59E0B' } else { '#FFEF4444' }
+        $ui.SecScoreArc.Stroke = Get-Brush $color
+        $ui.SecScoreText.Text = [string]$score
+        $ui.SecScoreLabel.Text = if ($score -ge 85) { 'Bien protégé' } elseif ($score -ge 60) { 'À améliorer' } else { 'Mal protégé' }
+        $ui.SecScoreLabel.Foreground = Get-Brush $color
+    }
+    function Load-Security {
+        $script:SecurityLoaded = $true
+        $ui.BtnSecRefresh.IsEnabled = $false
+        $ui.ListSecurity.ItemsSource = @([pscustomobject]@{ Severity = 'Info'; Title = 'Vérification en cours…'; Advice = 'Antivirus, pare-feu, mises à jour, réglages de Windows et programmes au démarrage.'; ActionLabel = $null; ActionId = $null })
+        Start-BgJob 'Get-SecurityStatus' { param($res) Show-Security (@($res)[0]); $ui.BtnSecRefresh.IsEnabled = $true }
+    }
+    function Show-Security($r) {
+        if (-not $r) { $ui.SecScoreLabel.Text = 'Vérification impossible'; return }
+        $items = @($r.Items)
+        $ui.ListSecurity.ItemsSource = $items
+        $crit = @($items | Where-Object { $_.Severity -eq 'Critique' }).Count
+        $warn = @($items | Where-Object { $_.Severity -eq 'Attention' }).Count
+        Set-SecScore ([math]::Max(5, 100 - 25 * $crit - 8 * $warn))
+        $ui.SecScoreSub.Text = if ($crit + $warn -eq 0) { 'Aucun problème de sécurité' } else { "$crit problème(s) important(s), $warn point(s) à améliorer" }
+        $ui.TxtSecAv.Text = $r.Facts.Antivirus; $ui.TxtSecFw.Text = $r.Facts.Firewall
+        $ui.TxtSecWu.Text = if ($r.Facts.Updates -ne '?') { "dernière installée $($r.Facts.Updates)" } else { 'inconnu' }
+        $ui.TxtSecHw.Text = $r.Facts.Hardware
+        $ui.TxtSecAv.Foreground = Get-Brush $(if ($r.Facts.Antivirus -eq 'Aucun') { '#FFEF4444' } else { '#FF0F172A' })
+        $ui.TxtSecFw.Foreground = Get-Brush $(if ($r.Facts.Firewall -eq 'Désactivé') { '#FFEF4444' } else { '#FF0F172A' })
+        $ui.TxtSecNote.Text = if ($r.IsAdmin) { "Vérifié à $((Get-Date).ToString('HH:mm'))." } else { "Vérifié à $((Get-Date).ToString('HH:mm')). En mode administrateur, PC Doctor vérifie aussi les exclusions de l'antivirus et le chiffrement du disque plus précisément." }
+        $ui.BadgeSecurity.Background = Get-Brush $(if ($crit) { '#FFEF4444' } else { '#FFF59E0B' })
+        Set-Badge $ui.BadgeSecurity $ui.BadgeSecurityText ($crit + $warn)
+    }
+    function Start-QuickScan {
+        $ui.BtnSecScan.IsEnabled = $false
+        Set-Status 'Analyse antivirus rapide en cours avec Microsoft Defender (quelques minutes, vous pouvez continuer à utiliser le PC)…'
+        Start-BgJob 'try { Start-MpScan -ScanType QuickScan -ErrorAction Stop; "ok" } catch { "erreur : $_" }' {
+            param($res)
+            $ui.BtnSecScan.IsEnabled = $true
+            if ([string](@($res)[0]) -eq 'ok') {
+                $t = @(); try { $t = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object { $_.InitialDetectionTime -ge (Get-Date).AddHours(-1) }) } catch {}
+                Set-Status $(if ($t.Count) { "Analyse terminée : $($t.Count) menace(s) trouvée(s) et traitée(s) par Microsoft Defender." } else { 'Analyse antivirus terminée : aucune menace trouvée.' })
+                Load-Security
+            } else {
+                Set-Status 'L''analyse n''a pas pu être lancée d''ici (autre antivirus, ou droits insuffisants) : ouverture de Sécurité Windows.'
+                Start-Process 'windowsdefender://threat'
+            }
+        }
+    }
+    function Disable-LocalAccount([string]$name) {
+        if ($name -notmatch '^[\w .-]{1,40}$') { return }
+        $r = [System.Windows.MessageBox]::Show($window, "Désactiver le compte « $name » ?`n`nIl ne pourra plus être utilisé pour ouvrir une session (vos fichiers et votre compte ne sont pas touchés). Windows va demander l'autorisation administrateur.", 'PC Doctor', 'YesNo', 'Question')
+        if ($r -ne 'Yes') { return }
+        Start-AdminConsole ("& '{0}' user '{1}' /active:no" -f (Get-SysExe 'net.exe'), $name) 'Desactivation de compte'
+        Set-Status "Quand la fenêtre administrateur a terminé, cliquez sur « Vérifier à nouveau »."
+    }
+    $ui.BtnSecRefresh.Add_Click({ Load-Security })
+    $ui.BtnSecScan.Add_Click({ Start-QuickScan })
+    $ui.BtnSecOpen.Add_Click({ Start-Process 'windowsdefender://' })
+
     # Alertes
     $ui.ChkAlerts.Add_Checked({ if (-not $script:Loading) { Set-Setting 'Alerts' '1' } })
     $ui.ChkAlerts.Add_Unchecked({ if (-not $script:Loading) { Set-Setting 'Alerts' '0' } })
@@ -5718,6 +6067,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
 
     $window.Add_Loaded({
             Start-FullAnalysis
+            Load-Security
             if ((Get-Settings)['CheckUpdates'] -ne '0') { Start-UpdateCheck $false }
         })
     $window.Add_Closing({
