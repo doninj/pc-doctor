@@ -828,7 +828,7 @@ if ($Monitor) {
 $widgetXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="PC Doctor - Widget" Width="300" SizeToContent="Height" WindowStyle="None" AllowsTransparency="True"
+        Title="PC Doctor - Widget" SizeToContent="WidthAndHeight" WindowStyle="None" AllowsTransparency="True"
         Background="Transparent" ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True"
         FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="12" UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
   <Window.Resources>
@@ -862,7 +862,7 @@ $widgetXaml = @'
     </Style>
     <Style x:Key="Value" TargetType="TextBlock">
       <Setter Property="Foreground" Value="White"/>
-      <Setter Property="FontSize" Value="19"/>
+      <Setter Property="FontSize" Value="16"/>
       <Setter Property="FontWeight" Value="SemiBold"/>
       <Setter Property="FontFamily" Value="Segoe UI Variable Display, Segoe UI"/>
     </Style>
@@ -876,7 +876,7 @@ $widgetXaml = @'
     <Style x:Key="Pill" TargetType="Border">
       <Setter Property="CornerRadius" Value="8"/>
       <Setter Property="Padding" Value="7,1"/>
-      <Setter Property="Margin" Value="8,4,0,0"/>
+      <Setter Property="Margin" Value="7,2,0,0"/>
       <Setter Property="VerticalAlignment" Value="Top"/>
       <Setter Property="Background" Value="#22FFFFFF"/>
     </Style>
@@ -887,7 +887,7 @@ $widgetXaml = @'
     </Style>
   </Window.Resources>
 
-  <Border x:Name="Root" CornerRadius="16" BorderBrush="#30FFFFFF" BorderThickness="1" Padding="16,12,16,14" Margin="8">
+  <Border x:Name="Root" Width="250" CornerRadius="14" BorderBrush="#30FFFFFF" BorderThickness="1" Padding="14,10,14,12" Margin="8">
     <Border.Background>
       <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
         <GradientStop Color="#F2161D2E" Offset="0"/>
@@ -904,7 +904,7 @@ $widgetXaml = @'
         <TextBlock x:Name="WClock" Foreground="#FF7D889B" Margin="8,0,0,0" VerticalAlignment="Center"/>
       </DockPanel>
 
-      <StackPanel Margin="0,12,0,0">
+      <StackPanel Margin="0,9,0,0">
         <DockPanel>
           <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
             <TextBlock x:Name="WCpu" Text="—" Style="{StaticResource Value}"/>
@@ -916,7 +916,7 @@ $widgetXaml = @'
         <TextBlock x:Name="WCpuSub" Style="{StaticResource Sub}" Margin="26,0,0,0"/>
         <ProgressBar x:Name="WCpuBar" Margin="26,6,0,0"/>
       </StackPanel>
-      <StackPanel Margin="0,12,0,0">
+      <StackPanel Margin="0,9,0,0">
         <DockPanel>
           <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
             <TextBlock x:Name="WGpu" Text="—" Style="{StaticResource Value}"/>
@@ -928,7 +928,7 @@ $widgetXaml = @'
         <TextBlock x:Name="WGpuSub" Style="{StaticResource Sub}" Margin="26,0,0,0"/>
         <ProgressBar x:Name="WGpuBar" Foreground="#FFA78BFA" Margin="26,6,0,0"/>
       </StackPanel>
-      <StackPanel Margin="0,12,0,0">
+      <StackPanel Margin="0,9,0,0">
         <DockPanel>
           <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
             <TextBlock x:Name="WRam" Text="—" Style="{StaticResource Value}"/>
@@ -939,7 +939,7 @@ $widgetXaml = @'
         <TextBlock x:Name="WRamSub" Style="{StaticResource Sub}" Margin="26,0,0,0"/>
         <ProgressBar x:Name="WRamBar" Foreground="#FF34D399" Margin="26,6,0,0"/>
       </StackPanel>
-      <StackPanel Margin="0,12,0,0">
+      <StackPanel Margin="0,9,0,0">
         <DockPanel>
           <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
             <TextBlock x:Name="WDisk" Text="—" Style="{StaticResource Value}"/>
@@ -952,7 +952,7 @@ $widgetXaml = @'
         <ProgressBar x:Name="WDiskBar" Foreground="#FFFBBF24" Margin="26,6,0,0"/>
       </StackPanel>
       <!-- Historique -->
-      <Border Background="#14FFFFFF" CornerRadius="10" Padding="10,8" Margin="0,14,0,0">
+      <Border x:Name="WHistBox" Background="#14FFFFFF" CornerRadius="10" Padding="10,8" Margin="0,12,0,0">
         <StackPanel>
           <DockPanel>
             <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
@@ -994,6 +994,10 @@ function Set-WTemp($pill, $text, [double]$t, [double]$warn, [double]$hot, [strin
 }
 function Format-Rate([double]$b) { if ($b -lt 0) { '—' } elseif ($b -ge 1MB) { '{0:N1} Mo/s' -f ($b / 1MB) } else { '{0:N0} Ko/s' -f ($b / 1KB) } }
 
+function Set-WidgetDetailsVisibility($u, [bool]$on) {
+    foreach ($n in 'WCpuSub', 'WGpuSub', 'WRamSub', 'WDiskSub', 'WHistBox') { $u[$n].Visibility = $(if ($on) { 'Visible' } else { 'Collapsed' }) }
+}
+
 $script:WHistCpu = New-Object System.Collections.Generic.List[double]
 $script:WHistGpu = New-Object System.Collections.Generic.List[double]
 function Update-Widget($u, $s) {
@@ -1027,6 +1031,8 @@ function Update-Widget($u, $s) {
     $u.WDiskBar.Value = [math]::Max(0, $s.DiskBusy)
     $u.WDiskSub.Text = "L {0}  ·  É {1}  ·  {2:N0} % plein" -f (Format-Rate $s.DiskRead), (Format-Rate $s.DiskWrite), [math]::Max(0, $s.DiskUsedPct)
     Set-WTemp $u.WDiskTempPill $u.WDiskTemp $s.DiskTemp 55 65 'Température du SSD : ouvrez le widget depuis PC Doctor en mode administrateur, ou lancez HWiNFO.'
+    # En mode compact, les détails restent accessibles en survolant les valeurs
+    foreach ($n in 'Cpu', 'Gpu', 'Ram', 'Disk') { $u["W$n"].ToolTip = $u["W${n}Sub"].Text }
     # Historique (60 points = 2 minutes)
     foreach ($pair in @(@($script:WHistCpu, $s.Cpu), @($script:WHistGpu, $s.GpuUsage))) {
         $pair[0].Add([math]::Max(0, [double]$pair[1])); while ($pair[0].Count -gt 60) { $pair[0].RemoveAt(0) }
@@ -1072,6 +1078,16 @@ if ($Widget) {
         function Update-PinIcon { $wu.WPin.Foreground = Get-WBrush $(if ($ww.Topmost) { '#FF5B8CFF' } else { '#FF7D889B' }); $wu.WPin.ToolTip = if ($ww.Topmost) { 'Toujours au premier plan (cliquer pour désactiver)' } else { 'Cliquer pour garder le widget au premier plan' } }
         function Set-WidgetTopmost([bool]$on) { $ww.Topmost = $on; Set-Setting 'WidgetTopmost' $(if ($on) { '1' } else { '0' }); Update-PinIcon; $script:MiTop.IsChecked = $on }
         Update-PinIcon
+        function Set-WidgetScale([double]$s, [switch]$NoSave) {
+            $s = [math]::Max(0.6, [math]::Min(1.2, $s))
+            $wu.Root.LayoutTransform = New-Object System.Windows.Media.ScaleTransform($s, $s)
+            if (-not $NoSave) { Set-Setting 'WidgetScale' $s.ToString([Globalization.CultureInfo]::InvariantCulture) }
+        }
+        function Set-WidgetDetails([bool]$on, [switch]$NoSave) {
+            Set-WidgetDetailsVisibility $wu $on
+            $script:MiDetails.IsChecked = $on
+            if (-not $NoSave) { Set-Setting 'WidgetDetails' $(if ($on) { '1' } else { '0' }) }
+        }
 
         # Déplacement à la souris
         $wu.Root.Add_MouseLeftButtonDown({
@@ -1099,6 +1115,17 @@ if ($Widget) {
             [void]$miOp.Items.Add($it)
         }
         [void]$menu.Items.Add($miOp)
+        $miSize = New-Object System.Windows.Controls.MenuItem; $miSize.Header = 'Taille'
+        foreach ($v in @(@('Petite', 0.7), @('Moyenne', 0.85), @('Grande', 1.0))) {
+            $it = New-Object System.Windows.Controls.MenuItem; $it.Header = $v[0]; $it.Tag = $v[1]
+            $it.Add_Click({ param($s, $e) Set-WidgetScale ([double]$s.Tag) })
+            [void]$miSize.Items.Add($it)
+        }
+        [void]$menu.Items.Add($miSize)
+        $script:MiDetails = New-Object System.Windows.Controls.MenuItem
+        $script:MiDetails.Header = 'Afficher les détails et l''historique'; $script:MiDetails.IsCheckable = $true
+        $script:MiDetails.Add_Click({ Set-WidgetDetails $script:MiDetails.IsChecked })
+        [void]$menu.Items.Add($script:MiDetails)
         [void]$menu.Items.Add((New-Object System.Windows.Controls.Separator))
         $miOpen = New-Object System.Windows.Controls.MenuItem; $miOpen.Header = 'Ouvrir PC Doctor'
         $miOpen.Add_Click({ $c = Get-LaunchCommand; $psi = New-Object Diagnostics.ProcessStartInfo($c.Exe, $c.Args); $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; [void][Diagnostics.Process]::Start($psi) })
@@ -1107,6 +1134,11 @@ if ($Widget) {
         $miClose.Add_Click({ $ww.Close() })
         [void]$menu.Items.Add($miClose)
         $wu.Root.ContextMenu = $menu
+
+        # Taille et détails (compact par défaut)
+        $sc = 0.85; [void][double]::TryParse([string]$cfg['WidgetScale'], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$sc)
+        Set-WidgetScale $sc -NoSave
+        Set-WidgetDetails ($cfg['WidgetDetails'] -eq '1') -NoSave
 
         [void][PCDoctor.LiveSensors]::Read()
         $wTimer = New-Object System.Windows.Threading.DispatcherTimer
