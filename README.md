@@ -32,11 +32,16 @@
 | **Plantages** | Écrans bleus, coupures nettes, logiciels qui plantent et erreurs disque des 30 derniers jours. |
 | **Espace disque** | Quels dossiers et fichiers prennent le plus de place (navigation par double-clic, plus gros fichiers, répartition par type). |
 | **Nettoyage** | Fichiers temporaires, caches, corbeille : combien de place on peut récupérer, et nettoyage en un clic. |
-| **Paramètres** | Thème clair / sombre, mise à jour automatique de PC Doctor (vérifiée par empreinte SHA-256). |
+| **Paramètres** | Thème clair / sombre, mise à jour automatique de PC Doctor (vérifiée par empreinte SHA-256), widget au démarrage. |
+| **Widget** | Petite fenêtre de bureau translucide : utilisation et température du processeur, de la carte graphique, de la RAM et du SSD en direct. Compact par défaut, taille, opacité, premier plan, détails et historique au clic droit. |
 
 Rien n'est modifié sans confirmation. Les réglages (démarrage, limite de puissance, démarrage rapide…) sont réversibles.
 
-Mode surveillance seul (boîte noire, sans fenêtre) : `"PC Doctor.exe" --monitor`.
+Modes sans fenêtre principale :
+- `"PC Doctor.exe" --widget` : le widget seul.
+- `"PC Doctor.exe" --monitor` : la boîte noire seule (icône près de l'horloge).
+
+> Température du processeur dans le widget : Windows ne la fournit pas pour tous les processeurs (notamment AMD Ryzen). Elle s'affiche automatiquement si **Core Temp** ou **HWiNFO** (option « Shared Memory Support ») est lancé.
 
 ## Installation
 
