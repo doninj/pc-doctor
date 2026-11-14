@@ -301,6 +301,72 @@ namespace PCDoctor {
     }
 
     // ---------------------------------------------------------------------
+    //  Jeu et confort : souris, touches rémanentes, écrans (lecture / réglage)
+    // ---------------------------------------------------------------------
+    public class DisplayInfo { public string Name = "", Device = ""; public int Width, Height, Hz, MaxHz, MaxWidth, MaxHeight; }
+    public static class Tweaks {
+        [DllImport("user32.dll")] static extern bool SystemParametersInfo(uint action, uint param, int[] data, uint winIni);
+        [StructLayout(LayoutKind.Sequential)] struct STICKYKEYS { public uint cbSize; public uint dwFlags; }
+        [DllImport("user32.dll", EntryPoint = "SystemParametersInfo")] static extern bool SpiSticky(uint action, uint param, ref STICKYKEYS data, uint winIni);
+        const uint SPIF_SAVE = 3;   // enregistre dans le profil et prévient les programmes
+
+        public static bool MouseAccel() { int[] m = new int[3]; SystemParametersInfo(3, 0, m, 0); return m[2] != 0; }
+        public static bool SetMouseAccel(bool on) { return SystemParametersInfo(4, 0, on ? new int[] { 6, 10, 1 } : new int[] { 0, 0, 0 }, SPIF_SAVE); }
+        public static bool StickyHotkey() { STICKYKEYS s = new STICKYKEYS(); s.cbSize = 8; SpiSticky(0x3A, 8, ref s, 0); return (s.dwFlags & 4) != 0; }
+        public static bool SetStickyHotkey(bool on) {
+            STICKYKEYS s = new STICKYKEYS(); s.cbSize = 8;
+            if (!SpiSticky(0x3A, 8, ref s, 0)) return false;
+            s.dwFlags = on ? (s.dwFlags | 4u) : (s.dwFlags & ~4u);
+            return SpiSticky(0x3B, 8, ref s, SPIF_SAVE);
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct DISPLAY_DEVICE {
+            public int cb;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+            public int StateFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct DEVMODE {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+            public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+            public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+            public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+            public short dmLogPixels;
+            public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+            public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+        }
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplayDevices(string device, uint index, ref DISPLAY_DEVICE dd, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplaySettings(string device, int mode, ref DEVMODE dm);
+
+        public static List<DisplayInfo> Displays() {
+            List<DisplayInfo> list = new List<DisplayInfo>();
+            for (uint i = 0; i < 16; i++) {
+                DISPLAY_DEVICE dd = new DISPLAY_DEVICE(); dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+                if (!EnumDisplayDevices(null, i, ref dd, 0)) break;
+                if ((dd.StateFlags & 1) == 0) continue;            // pas relié au bureau
+                DEVMODE cur = new DEVMODE(); cur.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+                if (!EnumDisplaySettings(dd.DeviceName, -1, ref cur)) continue;
+                DisplayInfo d = new DisplayInfo();
+                d.Device = dd.DeviceName; d.Width = cur.dmPelsWidth; d.Height = cur.dmPelsHeight; d.Hz = cur.dmDisplayFrequency;
+                DISPLAY_DEVICE mon = new DISPLAY_DEVICE(); mon.cb = dd.cb;
+                if (EnumDisplayDevices(dd.DeviceName, 0, ref mon, 0)) d.Name = mon.DeviceString ?? "";
+                DEVMODE m = new DEVMODE(); m.dmSize = cur.dmSize;
+                for (int k = 0; EnumDisplaySettings(dd.DeviceName, k, ref m); k++) {
+                    if (m.dmPelsWidth == d.Width && m.dmPelsHeight == d.Height && m.dmDisplayFrequency > d.MaxHz) d.MaxHz = m.dmDisplayFrequency;
+                    if ((long)m.dmPelsWidth * m.dmPelsHeight > (long)d.MaxWidth * d.MaxHeight) { d.MaxWidth = m.dmPelsWidth; d.MaxHeight = m.dmPelsHeight; }
+                }
+                list.Add(d);
+            }
+            return list;
+        }
+    }
+
+    // ---------------------------------------------------------------------
     //  Test de stabilité : charge processeur, RAM et carte graphique, avec
     //  arrêt automatique si les températures dépassent les seuils.
     // ---------------------------------------------------------------------
@@ -1047,7 +1113,7 @@ if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp
 # ---------------------------------------------------------------------------
 #  Réglages partagés (appli + boîte noire) : %LOCALAPPDATA%\PCDoctor\settings.ini
 # ---------------------------------------------------------------------------
-$script:AppVersion = '2.6.0'
+$script:AppVersion = '2.7.0'
 $script:Repo = 'doninj/pc-doctor'
 $script:SettingsFile = Join-Path $script:LogDir 'settings.ini'
 $script:BlackBoxDir = Join-Path $script:LogDir 'boite-noire'
@@ -3030,6 +3096,12 @@ $xamlText = @'
           </ListBoxItem>
           <ListBoxItem>
             <DockPanel>
+              <Border x:Name="BadgeGaming" Style="{StaticResource Badge}" Background="#FF3B6EF5" DockPanel.Dock="Right"><TextBlock x:Name="BadgeGamingText" Style="{StaticResource BadgeText}"/></Border>
+              <TextBlock Style="{StaticResource NavIcon}" Text="&#xE7FC;"/><TextBlock Style="{StaticResource NavText}" Text="Jeu et confort"/>
+            </DockPanel>
+          </ListBoxItem>
+          <ListBoxItem>
+            <DockPanel>
               <Border x:Name="BadgeDrivers" Style="{StaticResource Badge}" Background="#FFF59E0B" DockPanel.Dock="Right"><TextBlock x:Name="BadgeDriversText" Style="{StaticResource BadgeText}"/></Border>
               <TextBlock Style="{StaticResource NavIcon}" Text="&#xE772;"/><TextBlock Style="{StaticResource NavText}" Text="Pilotes"/>
             </DockPanel>
@@ -3641,7 +3713,105 @@ $xamlText = @'
           </ScrollViewer>
         </TabItem>
 
-        <!-- PILOTES -->        <TabItem>
+        <!-- JEU ET CONFORT -->
+        <TabItem>
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="GamingRoot" Margin="32,28,32,24">
+              <TextBlock Style="{StaticResource PageTitle}" Text="Jeu et confort"/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Les réglages de Windows qui comptent en jeu et au quotidien. Chaque réglage se change en un clic et se remet aussi facilement : rien n'est modifié sans que vous cliquiez."/>
+              <Border Style="{StaticResource Card}" Margin="0,18,0,20">
+                <DockPanel>
+                  <Button x:Name="BtnGamingApply" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="16,0,0,0">
+                    <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE73E;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock x:Name="TxtGamingApply" Text="Appliquer les réglages conseillés"/></StackPanel>
+                  </Button>
+                  <StackPanel VerticalAlignment="Center">
+                    <TextBlock x:Name="TxtGamingSummary" Text="…" FontSize="17" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                    <TextBlock x:Name="TxtGamingSub" Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                  </StackPanel>
+                </DockPanel>
+              </Border>
+              <TextBlock Style="{StaticResource Section}" Text="Jeu"/>
+              <ItemsControl x:Name="ListGaming">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <Border x:Name="Bd" Style="{StaticResource Card}" Margin="0,0,0,10" Padding="16,14">
+                      <DockPanel>
+                        <Border x:Name="IconBg" Width="38" Height="38" CornerRadius="19" Background="#FFEFF4FF" DockPanel.Dock="Left" VerticalAlignment="Top" Margin="0,0,14,0">
+                          <TextBlock x:Name="Icon" Text="&#xE946;" FontFamily="{StaticResource Icons}" FontSize="17" Foreground="#FF3B6EF5" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <Button x:Name="Act" DockPanel.Dock="Right" Style="{StaticResource Small}" Content="{Binding ActionLabel, Mode=OneWay}" Tag="{Binding ActionId, Mode=OneWay}" VerticalAlignment="Center" Margin="14,0,0,0"/>
+                        <StackPanel VerticalAlignment="Center">
+                          <TextBlock Text="{Binding Title, Mode=OneWay}" FontWeight="SemiBold" FontSize="14.5" TextWrapping="Wrap"/>
+                          <TextBlock Text="{Binding Advice, Mode=OneWay}" TextWrapping="Wrap" Margin="0,3,0,0" Foreground="#FF475569"/>
+                        </StackPanel>
+                      </DockPanel>
+                    </Border>
+                    <DataTemplate.Triggers>
+                      <DataTrigger Binding="{Binding ActionLabel}" Value="{x:Null}"><Setter TargetName="Act" Property="Visibility" Value="Collapsed"/></DataTrigger>
+                      <DataTrigger Binding="{Binding Severity}" Value="Critique">
+                        <Setter TargetName="IconBg" Property="Background" Value="#FFFEECEC"/>
+                        <Setter TargetName="Icon" Property="Foreground" Value="#FFEF4444"/>
+                        <Setter TargetName="Icon" Property="Text" Value="&#xEA39;"/>
+                        <Setter TargetName="Bd" Property="BorderBrush" Value="#FFFBCACA"/>
+                      </DataTrigger>
+                      <DataTrigger Binding="{Binding Severity}" Value="Attention">
+                        <Setter TargetName="IconBg" Property="Background" Value="#FFFFF4E0"/>
+                        <Setter TargetName="Icon" Property="Foreground" Value="#FFF59E0B"/>
+                        <Setter TargetName="Icon" Property="Text" Value="&#xE7BA;"/>
+                      </DataTrigger>
+                      <DataTrigger Binding="{Binding Severity}" Value="OK">
+                        <Setter TargetName="IconBg" Property="Background" Value="#FFE7F8EE"/>
+                        <Setter TargetName="Icon" Property="Foreground" Value="#FF22C55E"/>
+                        <Setter TargetName="Icon" Property="Text" Value="&#xE73E;"/>
+                      </DataTrigger>
+                    </DataTemplate.Triggers>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+              <TextBlock Style="{StaticResource Section}" Text="Confort" Margin="0,14,0,10"/>
+              <ItemsControl x:Name="ListComfort">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <Border x:Name="Bd" Style="{StaticResource Card}" Margin="0,0,0,10" Padding="16,14">
+                      <DockPanel>
+                        <Border x:Name="IconBg" Width="38" Height="38" CornerRadius="19" Background="#FFEFF4FF" DockPanel.Dock="Left" VerticalAlignment="Top" Margin="0,0,14,0">
+                          <TextBlock x:Name="Icon" Text="&#xE946;" FontFamily="{StaticResource Icons}" FontSize="17" Foreground="#FF3B6EF5" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <Button x:Name="Act" DockPanel.Dock="Right" Style="{StaticResource Small}" Content="{Binding ActionLabel, Mode=OneWay}" Tag="{Binding ActionId, Mode=OneWay}" VerticalAlignment="Center" Margin="14,0,0,0"/>
+                        <StackPanel VerticalAlignment="Center">
+                          <TextBlock Text="{Binding Title, Mode=OneWay}" FontWeight="SemiBold" FontSize="14.5" TextWrapping="Wrap"/>
+                          <TextBlock Text="{Binding Advice, Mode=OneWay}" TextWrapping="Wrap" Margin="0,3,0,0" Foreground="#FF475569"/>
+                        </StackPanel>
+                      </DockPanel>
+                    </Border>
+                    <DataTemplate.Triggers>
+                      <DataTrigger Binding="{Binding ActionLabel}" Value="{x:Null}"><Setter TargetName="Act" Property="Visibility" Value="Collapsed"/></DataTrigger>
+                      <DataTrigger Binding="{Binding Severity}" Value="Critique">
+                        <Setter TargetName="IconBg" Property="Background" Value="#FFFEECEC"/>
+                        <Setter TargetName="Icon" Property="Foreground" Value="#FFEF4444"/>
+                        <Setter TargetName="Icon" Property="Text" Value="&#xEA39;"/>
+                        <Setter TargetName="Bd" Property="BorderBrush" Value="#FFFBCACA"/>
+                      </DataTrigger>
+                      <DataTrigger Binding="{Binding Severity}" Value="Attention">
+                        <Setter TargetName="IconBg" Property="Background" Value="#FFFFF4E0"/>
+                        <Setter TargetName="Icon" Property="Foreground" Value="#FFF59E0B"/>
+                        <Setter TargetName="Icon" Property="Text" Value="&#xE7BA;"/>
+                      </DataTrigger>
+                      <DataTrigger Binding="{Binding Severity}" Value="OK">
+                        <Setter TargetName="IconBg" Property="Background" Value="#FFE7F8EE"/>
+                        <Setter TargetName="Icon" Property="Foreground" Value="#FF22C55E"/>
+                        <Setter TargetName="Icon" Property="Text" Value="&#xE73E;"/>
+                      </DataTrigger>
+                    </DataTemplate.Triggers>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </StackPanel>
+          </ScrollViewer>
+        </TabItem>
+
+        <!-- PILOTES -->
+        <TabItem>
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="DriversRoot" Margin="32,28,32,24">
               <TextBlock Style="{StaticResource PageTitle}" Text="Pilotes"/>
@@ -4547,7 +4717,7 @@ try {
 
     function Set-Status([string]$t) { $script:ui.TxtStatus.Text = $t }
 
-    $script:Pages = @{ diag = 0; solutions = 1; blackbox = 2; stress = 3; security = 4; drivers = 5; software = 6; perf = 7; network = 8; startup = 9; procs = 10; crashes = 11; disk = 12; clean = 13; settings = 14 }
+    $script:Pages = @{ diag = 0; solutions = 1; blackbox = 2; stress = 3; security = 4; gaming = 5; drivers = 6; software = 7; perf = 8; network = 9; startup = 10; procs = 11; crashes = 12; disk = 13; clean = 14; settings = 15 }
     function Show-Page([string]$name) { if ($script:Pages.ContainsKey($name)) { $ui.NavList.SelectedIndex = $script:Pages[$name] } }
     $script:DriversLoaded = $false
     $script:SoftwareLoaded = $false
@@ -4560,6 +4730,7 @@ try {
                 if ($i -eq $script:Pages['software'] -and -not $script:SoftwareLoaded) { Start-SoftwareSearch }
                 if ($i -eq $script:Pages['blackbox']) { Update-BlackBoxStatus; Show-BlackBoxCrashes }
                 if ($i -eq $script:Pages['security'] -and -not $script:SecurityLoaded) { Load-Security }
+                if ($i -eq $script:Pages['gaming']) { Show-Gaming }
             } catch { Write-Log "Navigation : $_ $($_.ScriptStackTrace)" }
         })
     $ui.NavList.SelectedIndex = 0
@@ -4621,6 +4792,7 @@ if (`$h -ne '$hash') { Add-Type -AssemblyName PresentationFramework; [void][Syst
         if ($id -like 'ms-settings:*') { Start-Process $id; return }
         if ($id -like 'windowsdefender:*') { Start-Process $id; return }
         if ($id -like 'sec-disable-user:*') { Disable-LocalAccount $id.Substring(17); return }
+        if ($id -like 'tweak:*') { $p = $id.Split(':'); Invoke-Tweak $p[1] ($p[2] -eq '1'); return }
         if ($id -like 'gpu-pl:*') { Set-GpuPowerLimit ([int]$id.Substring(7)); return }
         if ($id -like 'power:*') { Set-PowerPlan $id.Substring(6); return }
         switch ($id) {
@@ -4635,6 +4807,10 @@ if (`$h -ne '$hash') { Add-Type -AssemblyName PresentationFramework; [void][Syst
             'optionalfeatures' { Start-Process (Get-SysExe 'OptionalFeatures.exe') }
             'sec-hosts' { Start-Process (Join-Path $env:windir 'explorer.exe') -ArgumentList ('/select,"{0}"' -f (Join-Path $script:Sys32 'drivers\etc\hosts')) }
             'sec-quickscan' { Start-QuickScan }
+            'powerplan-balanced' {
+                [void](Invoke-Hidden (Get-SysExe 'powercfg.exe') '/setactive 381b4222-f694-41f0-9685-ff5bb260df2e')
+                Set-Status 'Mode d''alimentation « Utilisation normale » activé.'; Show-Gaming
+            }
             'bb-start' {
                 Start-BlackBox
                 Set-BlackBoxAutostart $true
@@ -4668,6 +4844,8 @@ if (`$h -ne '$hash') { Add-Type -AssemblyName PresentationFramework; [void][Syst
     $ui.ListSolutions.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
     $ui.DriversRoot.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
     $ui.ListSecurity.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
+    $ui.ListGaming.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
+    $ui.ListComfort.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
     $ui.PerfRoot.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
 
     function Refresh-Solutions {
@@ -5802,6 +5980,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
                 $t = @(); try { $t = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object { $_.InitialDetectionTime -ge (Get-Date).AddHours(-1) }) } catch {}
                 Set-Status $(if ($t.Count) { "Analyse terminée : $($t.Count) menace(s) trouvée(s) et traitée(s) par Microsoft Defender." } else { 'Analyse antivirus terminée : aucune menace trouvée.' })
                 Load-Security
+            try { Show-Gaming } catch { Write-Log "Jeu : $_ $($_.ScriptStackTrace)" }
             } else {
                 Set-Status 'L''analyse n''a pas pu être lancée d''ici (autre antivirus, ou droits insuffisants) : ouverture de Sécurité Windows.'
                 Start-Process 'windowsdefender://threat'
@@ -5818,6 +5997,153 @@ Read-Host 'Appuyez sur Entree pour fermer'
     $ui.BtnSecRefresh.Add_Click({ Load-Security })
     $ui.BtnSecScan.Add_Click({ Start-QuickScan })
     $ui.BtnSecOpen.Add_Click({ Start-Process 'windowsdefender://' })
+
+    # =====================================================================
+    #  Jeu et confort
+    # =====================================================================
+    function Get-TwReg([string]$path, [string]$name) { try { (Get-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop).$name } catch { $null } }
+    function Set-TwReg([string]$path, [string]$name, $value, [string]$type = 'DWord') {
+        if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force -ErrorAction Stop | Out-Null }
+        New-ItemProperty -LiteralPath $path -Name $name -Value $value -PropertyType $type -Force -ErrorAction Stop | Out-Null
+    }
+    $script:AdValues = @(
+        @('HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', 'SubscribedContent-338388Enabled'),
+        @('HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', 'SubscribedContent-338389Enabled'),
+        @('HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', 'SubscribedContent-353694Enabled'),
+        @('HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', 'SubscribedContent-353696Enabled'),
+        @('HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', 'SubscribedContent-310093Enabled'),
+        @('HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', 'SystemPaneSuggestionsEnabled'),
+        @('HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager', 'SoftLandingEnabled'),
+        @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced', 'ShowSyncProviderNotifications'),
+        @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced', 'Start_IrisRecommendations'),
+        @('HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement', 'ScoobeSystemSettingEnabled'),
+        @('HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo', 'Enabled')
+    )
+    # Chaque réglage : état actuel (Get), modification (Set), valeur conseillée (Rec, $null = question de goût)
+    $script:TweakDefs = @(
+        @{ Id = 'gamemode'; Section = 'game'; Name = 'Mode Jeu'; Rec = $true
+            Why = 'Windows donne la priorité au jeu et ne lance pas les mises à jour ni leurs redémarrages pendant que vous jouez.'
+            Get = { (Get-TwReg 'HKCU:\Software\Microsoft\GameBar' 'AutoGameModeEnabled') -ne 0 }
+            Set = { param($on) Set-TwReg 'HKCU:\Software\Microsoft\GameBar' 'AutoGameModeEnabled' ([int]$on) } },
+        @{ Id = 'windowed'; Section = 'game'; Name = 'Optimisations pour les jeux en fenêtre'; Rec = $true
+            Why = 'Moins de latence pour les jeux en fenêtre ou en plein écran sans bordure, et G-Sync / FreeSync possibles. Effet au prochain lancement du jeu.'
+            Get = { [string](Get-TwReg 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences' 'DirectXUserGlobalSettings') -match 'SwapEffectUpgradeEnable=1' }
+            Set = { param($on)
+                $v = ([string](Get-TwReg 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences' 'DirectXUserGlobalSettings')) -replace 'SwapEffectUpgradeEnable=\d;?', ''
+                Set-TwReg 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences' 'DirectXUserGlobalSettings' ($v + "SwapEffectUpgradeEnable=$([int]$on);") 'String' } },
+        @{ Id = 'dvr'; Section = 'game'; Name = 'Enregistrement des jeux en arrière-plan'; Rec = $false
+            Why = 'La Xbox Game Bar filme en continu les dernières minutes de jeu (« Enregistrer ce qui s''est passé ») : ça coûte quelques images par seconde. À garder seulement si vous vous en servez.'
+            Get = { (Get-TwReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'HistoricalCaptureEnabled') -eq 1 }
+            Set = { param($on) Set-TwReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'HistoricalCaptureEnabled' ([int]$on) } },
+        @{ Id = 'mouse'; Section = 'game'; Name = 'Accélération de la souris'; Rec = $false
+            Why = '(« Améliorer la précision du pointeur ») Désactivée, un même geste tourne toujours la caméra de la même distance : la visée est plus régulière en jeu. Effet immédiat.'
+            Get = { [PCDoctor.Tweaks]::MouseAccel() }
+            Set = { param($on) if (-not [PCDoctor.Tweaks]::SetMouseAccel($on)) { throw 'réglage refusé par Windows' } } },
+        @{ Id = 'sticky'; Section = 'game'; Name = 'Raccourci des touches rémanentes (Maj 5 fois)'; Rec = $false
+            Why = 'Appuyer plusieurs fois sur Maj en jeu (pour courir) ouvre une fenêtre qui fait sortir du jeu. Désactiver le raccourci ne touche pas à la fonction elle-même. Effet immédiat.'
+            Get = { [PCDoctor.Tweaks]::StickyHotkey() }
+            Set = { param($on) if (-not [PCDoctor.Tweaks]::SetStickyHotkey($on)) { throw 'réglage refusé par Windows' } } },
+        @{ Id = 'ads'; Section = 'comfort'; Name = 'Publicités et suggestions de Windows'; Rec = $false
+            Why = 'Applications suggérées dans le menu Démarrer, « conseils » et pubs dans l''Explorateur, écran « Terminez la configuration de votre appareil », identifiant publicitaire. Effet complet à la prochaine ouverture de session.'
+            Get = { @($script:AdValues | Where-Object { (Get-TwReg $_[0] $_[1]) -ne 0 }).Count -gt 0 }
+            Set = { param($on) foreach ($a in $script:AdValues) { Set-TwReg $a[0] $a[1] ([int]$on) } } },
+        @{ Id = 'bing'; Section = 'comfort'; Name = 'Résultats web (Bing) dans la recherche du menu Démarrer'; Rec = $false; Admin = $true
+            Why = 'Sans eux, la recherche ne montre que vos applications, fichiers et paramètres : plus rapide, et vos frappes ne partent pas sur Internet. Effet à la prochaine ouverture de session.'
+            Get = { (Get-TwReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions') -ne 1 }
+            Set = { param($on)
+                if ($on) { Remove-ItemProperty -LiteralPath 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' -Name 'DisableSearchBoxSuggestions' -ErrorAction SilentlyContinue }
+                else { Set-TwReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1 } } },
+        @{ Id = 'ext'; Section = 'comfort'; Name = 'Extensions des fichiers visibles (.pdf, .exe…)'; Rec = $true
+            Why = 'Permet de repérer un faux document piégé comme « facture.pdf.exe ». Effet à la prochaine fenêtre de l''Explorateur.'
+            Get = { (Get-TwReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'HideFileExt') -eq 0 }
+            Set = { param($on) Set-TwReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'HideFileExt' ([int](-not $on)) } },
+        @{ Id = 'dark'; Section = 'comfort'; Name = 'Mode sombre'; Rec = $null
+            Why = 'Thème sombre pour Windows et les applications compatibles, plus reposant le soir. Question de goût.'
+            Get = { (Get-TwReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme') -eq 0 }
+            Set = { param($on) foreach ($n in 'AppsUseLightTheme', 'SystemUsesLightTheme') { Set-TwReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' $n ([int](-not $on)) } } }
+    )
+
+    function Get-TweakRows([string]$section) {
+        foreach ($t in @($script:TweakDefs | Where-Object { $_.Section -eq $section })) {
+            $on = $false; try { $on = [bool](& $t.Get) } catch {}
+            $good = ($null -eq $t.Rec) -or ($on -eq $t.Rec)
+            $needAdmin = $t.Admin -and -not $script:IsAdmin
+            [pscustomobject]@{
+                Severity = $(if ($null -eq $t.Rec) { 'Neutre' } elseif ($good) { 'OK' } else { 'Info' })
+                Title = "$($t.Name) : $(if ($on) { 'activé' } else { 'désactivé' })"
+                Advice = $t.Why + $(if (-not $good) { " Conseillé : $(if ($t.Rec) { 'activé' } else { 'désactivé' })." } else { '' }) + $(if ($needAdmin) { ' Ce réglage demande le mode administrateur (bouton en bas à gauche).' } else { '' })
+                ActionLabel = $(if ($needAdmin) { $null } elseif ($on) { 'Désactiver' } else { 'Activer' })
+                ActionId = "tweak:$($t.Id):$(if ($on) { '0' } else { '1' })"
+                Fix = ((-not $good) -and -not $needAdmin); Id = $t.Id; Name = $t.Name; Rec = $t.Rec
+            }
+        }
+    }
+
+    function Get-GamingExtraRows {
+        $mk = { param($sev, $title, $advice, $label, $act) [pscustomobject]@{ Severity = $sev; Title = $title; Advice = $advice; ActionLabel = $label; ActionId = $act; Fix = $false; Name = $title } }
+        # Écrans : fréquence et résolution
+        $names = @()
+        try { $names = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop | ForEach-Object { -join @($_.UserFriendlyName | Where-Object { $_ } | ForEach-Object { [char]$_ }) }) } catch {}
+        $disp = @([PCDoctor.Tweaks]::Displays())
+        for ($i = 0; $i -lt $disp.Count; $i++) {
+            $d = $disp[$i]
+            $n = if ($disp.Count -eq $names.Count -and $names[$i]) { "Écran $($names[$i])" } elseif ($disp.Count -gt 1) { "Écran $($i + 1)" } else { 'Écran' }
+            if ($d.MaxHz -gt $d.Hz + 1) { & $mk 'Attention' "$n réglé sur $($d.Hz) Hz alors qu'il peut afficher $($d.MaxHz) Hz" "Images bien plus fluides en jeu comme sur le bureau. Choisissez $($d.MaxHz) Hz dans Affichage avancé > Fréquence d'actualisation. Si la valeur n'apparaît pas, utilisez un câble DisplayPort (ou HDMI 2.1)." 'Régler' 'ms-settings:display-advanced' }
+            else { & $mk 'OK' "$n : $($d.Width)×$($d.Height) à $($d.Hz) Hz" 'Réglé sur sa fréquence maximale : rien à faire.' $null $null }
+            if ([long]$d.MaxWidth * $d.MaxHeight -gt [long]$d.Width * $d.Height) { & $mk 'Info' "$n en $($d.Width)×$($d.Height) au lieu de $($d.MaxWidth)×$($d.MaxHeight)" 'L''image est moins nette qu''elle pourrait l''être. Choisissez la résolution « recommandée » dans Paramètres > Affichage.' 'Régler' 'ms-settings:display' }
+        }
+        # Mode d'alimentation
+        try {
+            $line = [string](@(Invoke-Hidden (Get-SysExe 'powercfg.exe') '/getactivescheme') | Where-Object { $_ -match '[0-9a-f]{8}-' } | Select-Object -First 1)
+            $pname = if ($line -match '\(([^)]+)\)') { $Matches[1] } else { '?' }
+            if ($line -match 'a1841308-3541-4fab-bc81-f71556f20b4a') { & $mk 'Attention' "Mode d'alimentation « $pname »" 'Le processeur et la carte graphique sont bridés pour économiser l''énergie : les jeux tournent moins vite.' 'Utilisation normale' 'powerplan-balanced' }
+            elseif ($line) { & $mk 'OK' "Mode d'alimentation : $pname" 'Le processeur monte en puissance dès qu''un jeu le demande.' $null $null }
+        } catch {}
+        # Planification GPU à accélération matérielle (réglage système : ouvert dans Windows)
+        $hags = Get-TwReg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode'
+        if ($hags -eq 2) { & $mk 'OK' 'Planification GPU à accélération matérielle : activée' 'Un peu moins de latence, et nécessaire pour la génération d''images DLSS des cartes RTX 40.' $null $null }
+        elseif ($hags -eq 1) { & $mk 'Info' 'Planification GPU à accélération matérielle : désactivée' 'L''activer réduit un peu la latence et permet la génération d''images DLSS (cartes RTX 40). Redémarrage nécessaire.' 'Ouvrir' 'ms-settings:display-advancedgraphics' }
+    }
+
+    function Show-Gaming {
+        $game = @(Get-GamingExtraRows) + @(Get-TweakRows 'game')
+        $comfort = @(Get-TweakRows 'comfort')
+        $ui.ListGaming.ItemsSource = $game
+        $ui.ListComfort.ItemsSource = $comfort
+        $fix = @(@($game) + @($comfort) | Where-Object { $_.Fix })
+        $att = @($game | Where-Object { $_.Severity -eq 'Attention' }).Count
+        $script:GamingFix = $fix
+        $ui.TxtGamingSummary.Text = if (-not $fix.Count -and -not $att) { 'Tout est bien réglé' } else { (@($(if ($fix.Count) { "$($fix.Count) réglage(s) conseillé(s)" }), $(if ($att) { "$att point(s) à corriger" }) | Where-Object { $_ }) -join ' et ') }
+        $ui.TxtGamingSub.Text = if ($fix.Count) { 'Le bouton s''occupe de : ' + (($fix | ForEach-Object { $_.Name }) -join ', ') + '. Chaque réglage peut être remis ensuite d''un clic.' } elseif ($att) { 'Les points en orange se règlent dans Windows : utilisez leur bouton.' } else { 'Les réglages conseillés pour jouer et pour le confort sont déjà en place.' }
+        $ui.BtnGamingApply.IsEnabled = ($fix.Count -gt 0)
+        Set-Badge $ui.BadgeGaming $ui.BadgeGamingText ($fix.Count + $att)
+    }
+
+    function Invoke-Tweak([string]$id, [bool]$on) {
+        $t = $script:TweakDefs | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+        if (-not $t) { return }
+        try {
+            & $t.Set $on
+            Set-Status "« $($t.Name) » $(if ($on) { 'activé' } else { 'désactivé' })."
+        } catch {
+            Write-Log "Réglage $id : $_"
+            if ($_.Exception -is [System.UnauthorizedAccessException] -or "$_" -match 'refus|denied|non autoris') { Set-Status "Ce réglage demande les droits administrateur : cliquez sur « Passer en administrateur » en bas à gauche, puis réessayez." }
+            else { Set-Status "Impossible de modifier « $($t.Name) » : $_" }
+        }
+        Show-Gaming
+    }
+
+    $ui.BtnGamingApply.Add_Click({
+            $fix = @($script:GamingFix)
+            if (-not $fix.Count) { return }
+            $txt = ($fix | ForEach-Object { "• $($_.Name) : $(if ($_.Rec) { 'activé' } else { 'désactivé' })" }) -join "`n"
+            $r = [System.Windows.MessageBox]::Show($window, "PC Doctor va appliquer ces réglages :`n`n$txt`n`nChacun pourra être remis d'un clic sur cette page.", 'Jeu et confort', 'OKCancel', 'Question')
+            if ($r -ne 'OK') { return }
+            $done = 0
+            foreach ($f in $fix) { $t = $script:TweakDefs | Where-Object { $_.Id -eq $f.Id } | Select-Object -First 1; try { & $t.Set ([bool]$t.Rec); $done++ } catch { Write-Log "Réglage $($f.Id) : $_" } }
+            Show-Gaming
+            Set-Status $(if ($done -eq $fix.Count) { "$done réglage(s) appliqué(s)." } else { "$done réglage(s) sur $($fix.Count) appliqué(s) : les autres demandent les droits administrateur." })
+        })
 
     # Alertes
     $ui.ChkAlerts.Add_Checked({ if (-not $script:Loading) { Set-Setting 'Alerts' '1' } })
@@ -6068,6 +6394,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
     $window.Add_Loaded({
             Start-FullAnalysis
             Load-Security
+            try { Show-Gaming } catch { Write-Log "Jeu : $_ $($_.ScriptStackTrace)" }
             if ((Get-Settings)['CheckUpdates'] -ne '0') { Start-UpdateCheck $false }
         })
     $window.Add_Closing({
