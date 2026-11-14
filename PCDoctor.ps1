@@ -319,7 +319,7 @@ namespace PCDoctor {
 
         public const string MutexName = @"Local\PCDoctorBlackBox";
         public const string StopEventName = @"Local\PCDoctorBlackBoxStop";
-        public const string Header = "time;gpu_temp;gpu_power;gpu_limit;gpu_clock;gpu_usage;cpu;ram;app";
+        public const string Header = "time;gpu_temp;gpu_power;gpu_limit;gpu_clock;gpu_usage;cpu;ram;app;cpu_temp;disk_temp;disk_busy";
 
         static ulong U(FILETIME f) { return ((ulong)f.High << 32) | f.Low; }
         static ulong _pIdle, _pKernel, _pUser;
@@ -419,6 +419,8 @@ namespace PCDoctor {
                 _stop = new EventWaitHandle(false, EventResetMode.AutoReset, StopEventName);
                 StartSmi();
                 CpuPercent();
+                // Températures processeur (Core Temp / HWiNFO) et SSD (SMART / HWiNFO), activité du disque système
+                LiveSensors.Start(null, Path.GetPathRoot(Environment.SystemDirectory));
 
                 Application.EnableVisualStyles();
                 _tray = new NotifyIcon();
@@ -456,6 +458,7 @@ namespace PCDoctor {
                 _tray.Visible = false;
                 _tray.Dispose();
                 try { if (_smi != null && !_smi.HasExited) _smi.Kill(); } catch { }
+                LiveSensors.Stop();
                 return 0;
             }
         }
@@ -481,6 +484,7 @@ namespace PCDoctor {
             double cpu = CpuPercent();
             int ram = RamPercent();
             string app = ForegroundApp();
+            SensorSnapshot ls = LiveSensors.Read();
             string gt = "", gp = "", gl = "", gc = "", gu = "";
             double gtemp = -1;
             string line = _smiLine;
@@ -493,11 +497,15 @@ namespace PCDoctor {
             }
             if (!_paused) {
                 DateTime now = DateTime.Now;
-                string row = string.Format(CultureInfo.InvariantCulture, "{0:yyyy-MM-ddTHH:mm:ss};{1};{2};{3};{4};{5};{6};{7};{8}",
-                    now, gt, gp, gl, gc, gu, cpu < 0 ? "" : cpu.ToString("0", CultureInfo.InvariantCulture), ram < 0 ? "" : ram.ToString(CultureInfo.InvariantCulture), app);
+                string row = string.Format(CultureInfo.InvariantCulture, "{0:yyyy-MM-ddTHH:mm:ss};{1};{2};{3};{4};{5};{6};{7};{8};{9};{10};{11}",
+                    now, gt, gp, gl, gc, gu, cpu < 0 ? "" : cpu.ToString("0", CultureInfo.InvariantCulture), ram < 0 ? "" : ram.ToString(CultureInfo.InvariantCulture), app,
+                    ls.CpuTemp < 0 ? "" : ls.CpuTemp.ToString("0.#", CultureInfo.InvariantCulture),
+                    ls.DiskTemp < 0 ? "" : ls.DiskTemp.ToString("0", CultureInfo.InvariantCulture),
+                    ls.DiskBusy < 0 ? "" : ls.DiskBusy.ToString("0", CultureInfo.InvariantCulture));
                 Write(now, row);
             }
             Alerts(gtemp, ram);
+            CpuAlert(ls.CpuTemp);
         }
 
         static void Write(DateTime now, string row) {
@@ -524,6 +532,17 @@ namespace PCDoctor {
             if (_ramCount >= 5 && (DateTime.Now - _lastAlertRam).TotalMinutes >= 15) {
                 _lastAlertRam = DateTime.Now;
                 _tray.ShowBalloonTip(10000, "Mémoire vive saturée", "La RAM est utilisée à " + ram + " % : le PC va ralentir. Fermez des programmes.", ToolTipIcon.Warning);
+            }
+        }
+
+        static int _cpuHot; static DateTime _lastAlertCpu = DateTime.MinValue;
+        static void CpuAlert(double t) {
+            if (!_alerts) return;
+            _cpuHot = t >= 90 ? _cpuHot + 1 : 0;
+            if (_cpuHot >= 3 && (DateTime.Now - _lastAlertCpu).TotalMinutes >= 10) {
+                _lastAlertCpu = DateTime.Now;
+                _tray.ShowBalloonTip(10000, "Processeur très chaud",
+                    string.Format(CultureInfo.InvariantCulture, "{0:0} °C. Vérifiez le ventirad, la poussière et la pâte thermique.", t), ToolTipIcon.Warning);
             }
         }
 
@@ -796,7 +815,7 @@ if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp
 # ---------------------------------------------------------------------------
 #  Réglages partagés (appli + boîte noire) : %LOCALAPPDATA%\PCDoctor\settings.ini
 # ---------------------------------------------------------------------------
-$script:AppVersion = '2.3.1'
+$script:AppVersion = '2.4.0'
 $script:Repo = 'doninj/pc-doctor'
 $script:SettingsFile = Join-Path $script:LogDir 'settings.ini'
 $script:BlackBoxDir = Join-Path $script:LogDir 'boite-noire'
@@ -2860,6 +2879,12 @@ $xamlText = @'
                       <Button x:Name="BtnBbStop" Content="Arrêter" Style="{StaticResource Secondary}" Margin="0,0,8,6"/>
                     </WrapPanel>
                     <CheckBox x:Name="ChkBbAutostart" Content="Lancer automatiquement avec Windows (recommandé)" Margin="0,8,0,0"/>
+                    <Border x:Name="BbCpuTempBox" Background="#FFF7F9FC" CornerRadius="8" Padding="10,8" Margin="0,10,0,0">
+                      <DockPanel>
+                        <Button x:Name="BtnBbCoreTemp" DockPanel.Dock="Right" Content="Lancer Core Temp" Style="{StaticResource Small}" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                        <TextBlock x:Name="TxtBbCpuTemp" TextWrapping="Wrap" FontSize="12" VerticalAlignment="Center"/>
+                      </DockPanel>
+                    </Border>
                     <TextBlock Style="{StaticResource MutedText}" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0" Text="Une icône PC Doctor apparaît près de l'horloge : clic droit pour la mettre en pause ou l'arrêter. Consommation : quasi nulle."/>
                   </StackPanel>
                 </Border>
@@ -2877,7 +2902,7 @@ $xamlText = @'
                         <ComboBoxItem Content="90 °C"/>
                       </ComboBox>
                     </StackPanel>
-                    <TextBlock Style="{StaticResource MutedText}" FontSize="12" TextWrapping="Wrap" Margin="0,12,0,0" Text="Une alerte est aussi affichée si la mémoire vive reste saturée (95 % ou plus)."/>
+                    <TextBlock Style="{StaticResource MutedText}" FontSize="12" TextWrapping="Wrap" Margin="0,12,0,0" Text="Une alerte est aussi affichée si le processeur dépasse 90 °C (avec Core Temp ou HWiNFO) ou si la mémoire vive reste saturée (95 % ou plus)."/>
                   </StackPanel>
                 </Border>
               </Grid>
@@ -2922,6 +2947,12 @@ $xamlText = @'
                     </Border>
                     <Border Background="#FFF7F9FC" CornerRadius="10" Padding="12,10" Margin="0,0,12,12">
                       <StackPanel>
+                        <DockPanel><TextBlock x:Name="ChartCpuTempInfo" DockPanel.Dock="Right" Style="{StaticResource MutedText}" FontSize="12"/><TextBlock Text="Température processeur" FontWeight="SemiBold" FontSize="12.5"/></DockPanel>
+                        <Canvas x:Name="ChartCpuTemp" Height="90" Margin="0,8,0,0" ClipToBounds="True"/>
+                      </StackPanel>
+                    </Border>
+                    <Border Background="#FFF7F9FC" CornerRadius="10" Padding="12,10" Margin="0,0,12,12">
+                      <StackPanel>
                         <DockPanel><TextBlock x:Name="ChartGpuPowerInfo" DockPanel.Dock="Right" Style="{StaticResource MutedText}" FontSize="12"/><TextBlock Text="Consommation carte graphique" FontWeight="SemiBold" FontSize="12.5"/></DockPanel>
                         <Canvas x:Name="ChartGpuPower" Height="90" Margin="0,8,0,0" ClipToBounds="True"/>
                       </StackPanel>
@@ -2938,6 +2969,12 @@ $xamlText = @'
                         <Canvas x:Name="ChartRam" Height="90" Margin="0,8,0,0" ClipToBounds="True"/>
                       </StackPanel>
                     </Border>
+                    <Border Background="#FFF7F9FC" CornerRadius="10" Padding="12,10" Margin="0,0,12,12">
+                      <StackPanel>
+                        <DockPanel><TextBlock x:Name="ChartDiskInfo" DockPanel.Dock="Right" Style="{StaticResource MutedText}" FontSize="12"/><TextBlock Text="SSD système (activité)" FontWeight="SemiBold" FontSize="12.5"/></DockPanel>
+                        <Canvas x:Name="ChartDisk" Height="90" Margin="0,8,0,0" ClipToBounds="True"/>
+                      </StackPanel>
+                    </Border>
                   </UniformGrid>
                   <TextBlock x:Name="TxtBbTableTitle" Text="Dernières mesures" FontWeight="SemiBold" Margin="0,4,0,8"/>
                   <Border Style="{StaticResource Panel}">
@@ -2945,10 +2982,12 @@ $xamlText = @'
                       <DataGrid.Columns>
                         <DataGridTextColumn Header="HEURE" Binding="{Binding TimeText}" Width="90"/>
                         <DataGridTextColumn Header="GPU °C" Binding="{Binding GpuTempText}" Width="80"/>
+                        <DataGridTextColumn Header="CPU °C" Binding="{Binding CpuTempText}" Width="80"/>
                         <DataGridTextColumn Header="GPU W" Binding="{Binding GpuPowerText}" Width="90"/>
                         <DataGridTextColumn Header="GPU %" Binding="{Binding GpuUsageText}" Width="75"/>
                         <DataGridTextColumn Header="PROCESSEUR" Binding="{Binding CpuText}" Width="100"/>
                         <DataGridTextColumn Header="RAM" Binding="{Binding RamText}" Width="75"/>
+                        <DataGridTextColumn Header="DISQUE" Binding="{Binding DiskBusyText}" Width="80"/>
                         <DataGridTextColumn Header="PROGRAMME AU PREMIER PLAN" Binding="{Binding App}" Width="*"/>
                       </DataGrid.Columns>
                     </DataGrid>
@@ -4693,7 +4732,36 @@ Read-Host 'Appuyez sur Entree pour fermer'
         $script:Loading = $true
         $ui.ChkBbAutostart.IsChecked = Test-BlackBoxAutostart
         $script:Loading = $false
+        Update-CpuTempSourceStatus
     }
+
+    # D'où vient la température du processeur (Windows ne la fournit pas pour tous les processeurs)
+    function Get-CpuTempSource {
+        foreach ($m in @(@('Global\HWiNFO_SENS_SM2', 'HWiNFO'), @('CoreTempMappingObject', 'Core Temp'), @('CoreTempMappingObjectEx', 'Core Temp'))) {
+            try { $mm = [System.IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting($m[0], 'Read'); $mm.Dispose(); return $m[1] } catch {}
+        }
+        return $null
+    }
+    function Update-CpuTempSourceStatus {
+        $src = Get-CpuTempSource
+        if ($src) {
+            $ui.TxtBbCpuTemp.Text = "Température du processeur : enregistrée via $src."
+            $ui.TxtBbCpuTemp.Foreground = Get-Brush '#FF15803D'
+            $ui.BtnBbCoreTemp.Visibility = 'Collapsed'
+        } else {
+            $installed = [PCDoctor.LiveSensors]::CoreTempInstalled()
+            $ui.TxtBbCpuTemp.Text = if ($installed) { "Température du processeur : non enregistrée. Lancez Core Temp (déjà installé) et, dans ses options, cochez « Démarrer avec Windows »." } else { "Température du processeur : non enregistrée. Installez Core Temp (gratuit) ou lancez HWiNFO avec « Shared Memory Support »." }
+            $ui.TxtBbCpuTemp.Foreground = Get-Brush '#FFB45309'
+            $ui.BtnBbCoreTemp.Content = if ($installed) { 'Lancer Core Temp' } else { 'Télécharger Core Temp' }
+            $ui.BtnBbCoreTemp.Visibility = 'Visible'
+        }
+    }
+    $ui.BtnBbCoreTemp.Add_Click({
+            if ([PCDoctor.LiveSensors]::CoreTempInstalled()) {
+                try { Start-Process -FilePath ([PCDoctor.LiveSensors]::CoreTempPath()); Set-Status 'Core Temp lancé : la boîte noire enregistre maintenant la température du processeur.' } catch { Set-Status "Impossible de lancer Core Temp : $_" }
+            } else { Start-Process 'https://www.alcpu.com/CoreTemp/' }
+            $script:BbRefreshAt = [DateTime]::Now.AddSeconds(4)
+        })
 
     function ConvertFrom-BbLine([string]$l) {
         $v = $l.Split(';')
@@ -4702,8 +4770,16 @@ Read-Host 'Appuyez sur Entree pour fermer'
         $n = { param($s) $x = 0.0; if ($s -and [double]::TryParse($s, [Globalization.NumberStyles]::Float, $inv, [ref]$x)) { $x } else { $null } }
         $t = [datetime]::ParseExact($v[0], 'yyyy-MM-ddTHH:mm:ss', $inv)
         $gt = & $n $v[1]; $gp = & $n $v[2]; $gl = & $n $v[3]; $gu = & $n $v[5]; $cpu = & $n $v[6]; $ram = & $n $v[7]
+        # Colonnes ajoutées en 2.4 (absentes des anciens enregistrements)
+        $ct = if ($v.Count -gt 9) { & $n $v[9] } else { $null }
+        $dt = if ($v.Count -gt 10) { & $n $v[10] } else { $null }
+        $db = if ($v.Count -gt 11) { & $n $v[11] } else { $null }
         [pscustomobject]@{
             Time = $t; GpuTemp = $gt; GpuPower = $gp; GpuLimit = $gl; GpuClock = (& $n $v[4]); GpuUsage = $gu; Cpu = $cpu; Ram = $ram; App = $v[8]
+            CpuTemp = $ct; DiskTemp = $dt; DiskBusy = $db
+            CpuTempText = $(if ($null -ne $ct) { "{0:N0} °C" -f $ct } else { '—' })
+            DiskTempText = $(if ($null -ne $dt) { "{0:N0} °C" -f $dt } else { '—' })
+            DiskBusyText = $(if ($null -ne $db) { "{0:N0} %" -f $db } else { '—' })
             TimeText = $t.ToString('HH:mm:ss')
             GpuTempText = $(if ($null -ne $gt) { "{0:N0} °C" -f $gt } else { '—' })
             GpuPowerText = $(if ($null -ne $gp) { "{0:N0} W" -f $gp } else { '—' })
@@ -4765,6 +4841,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
         $last = @($samples | Where-Object { $_.Time -ge $end.AddSeconds(-60) })
         $mx = { param($p) $vals = @($last | ForEach-Object { $_.$p } | Where-Object { $null -ne $_ }); if ($vals.Count) { ($vals | Measure-Object -Maximum).Maximum } else { $null } }
         $maxT = & $mx 'GpuTemp'; $maxP = & $mx 'GpuPower'; $maxU = & $mx 'GpuUsage'; $maxCpu = & $mx 'Cpu'; $maxRam = & $mx 'Ram'
+        $maxCt = & $mx 'CpuTemp'; $maxDt = & $mx 'DiskTemp'; $maxDb = & $mx 'DiskBusy'
         $lim = ($last | Where-Object { $_.GpuLimit } | Select-Object -Last 1).GpuLimit
         $app = ($last | Where-Object { $_.App } | Group-Object App | Sort-Object Count -Descending | Select-Object -First 1).Name
         $lines = New-Object System.Collections.Generic.List[string]
@@ -4778,6 +4855,15 @@ Read-Host 'Appuyez sur Entree pour fermer'
             if ($maxP -ge 0.9 * $lim) { $lines.Add(("• La carte graphique tirait presque toute sa puissance ({0:N0} W sur {1:N0} W) : un pic de consommation est possible. Testez l'alimentation (limite à 75 %, page Solutions)." -f $maxP, $lim)); $heavy = $true }
             else { $lines.Add(("• Consommation de la carte graphique : {0:N0} W au maximum (limite {1:N0} W)." -f $maxP, $lim)) }
         }
+        if ($null -ne $maxCt) {
+            if ($maxCt -ge 90) { $lines.Add(("• Processeur très chaud ({0:N0} °C) : la surchauffe du processeur est une cause probable (ventirad, pâte thermique, poussière)." -f $maxCt)); $heavy = $true }
+            elseif ($maxCt -ge 80) { $lines.Add(("• Processeur chaud ({0:N0} °C), mais sous sa limite de sécurité." -f $maxCt)) }
+            else { $lines.Add(("• Température du processeur normale ({0:N0} °C max) : pas de surchauffe côté processeur." -f $maxCt)) }
+        } else {
+            $lines.Add("• Température du processeur non enregistrée (lancez Core Temp ou HWiNFO pendant que la boîte noire tourne).")
+        }
+        if ($null -ne $maxDt -and $maxDt -ge 65) { $lines.Add(("• SSD très chaud ({0:N0} °C) : il peut ralentir fortement ou provoquer des gels." -f $maxDt)); $heavy = $true }
+        if ($null -ne $maxDb -and $maxDb -ge 95) { $lines.Add(("• Disque système occupé à {0:N0} % juste avant : il pouvait figer le PC." -f $maxDb)) }
         if ($null -ne $maxCpu -and $maxCpu -ge 90) { $lines.Add(("• Processeur à fond ({0:N0} %)." -f $maxCpu)); $heavy = $true }
         if ($null -ne $maxRam -and $maxRam -ge 95) { $lines.Add(("• Mémoire vive saturée ({0:N0} %)." -f $maxRam)); $heavy = $true }
         if ($app) { $lines.Add("• Programme au premier plan : $app.") }
@@ -4801,11 +4887,15 @@ Read-Host 'Appuyez sur Entree pour fermer'
         Draw-Chart $ui.ChartGpuPower @($samples | ForEach-Object { $_.GpuPower }) $pmax '#FF8B5CF6' $lim
         Draw-Chart $ui.ChartCpu @($samples | ForEach-Object { $_.Cpu }) 100 '#FF3B6EF5' $null
         Draw-Chart $ui.ChartRam @($samples | ForEach-Object { $_.Ram }) 100 '#FF22C55E' 95
+        Draw-Chart $ui.ChartCpuTemp @($samples | ForEach-Object { $_.CpuTemp }) 100 '#FFEF4444' 90
+        Draw-Chart $ui.ChartDisk @($samples | ForEach-Object { $_.DiskBusy }) 100 '#FFFBBF24' $null
         $mx = { param($p, $fmt) $vals = @($samples | ForEach-Object { $_.$p } | Where-Object { $null -ne $_ }); if ($vals.Count) { $fmt -f ($vals | Measure-Object -Maximum).Maximum } else { 'pas de données' } }
         $ui.ChartGpuTempInfo.Text = & $mx 'GpuTemp' 'max {0:N0} °C'
         $ui.ChartGpuPowerInfo.Text = (& $mx 'GpuPower' 'max {0:N0} W') + $(if ($lim) { " / limite {0:N0} W" -f $lim } else { '' })
         $ui.ChartCpuInfo.Text = & $mx 'Cpu' 'max {0:N0} %'
         $ui.ChartRamInfo.Text = & $mx 'Ram' 'max {0:N0} %'
+        $ui.ChartCpuTempInfo.Text = & $mx 'CpuTemp' 'max {0:N0} °C'
+        $ui.ChartDiskInfo.Text = (& $mx 'DiskBusy' 'max {0:N0} %') + $(& $mx 'DiskTemp' '  ·  SSD {0:N0} °C' | Where-Object { $_ -ne 'pas de données' })
         $ui.TxtBbTableTitle.Text = if ($isCrash) { 'Dernières mesures avant la coupure (la plus récente en haut)' } else { 'Dernières mesures (la plus récente en haut)' }
         $tail = @($samples | Select-Object -Last 45)
         [array]::Reverse($tail)
