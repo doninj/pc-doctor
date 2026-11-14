@@ -6,7 +6,8 @@ if (-not (Test-Path $csc)) { $csc = Join-Path $env:windir 'Microsoft.NET\Framewo
 
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'make-icon.ps1') | Out-Null
 
-$out = Join-Path $root 'PC Doctor.exe'
+$final = Join-Path $root 'PC Doctor.exe'
+$out = Join-Path $root 'PC Doctor.new.exe'
 # Moteur PowerShell de Windows (Windows PowerShell 5.1), intégré dans le processus de l'exe
 $sma = [System.Management.Automation.PSObject].Assembly.Location
 & $csc /nologo /target:winexe /optimize+ /platform:anycpu `
@@ -18,4 +19,10 @@ $sma = [System.Management.Automation.PSObject].Assembly.Location
     /reference:System.Windows.Forms.dll `
     (Join-Path $PSScriptRoot 'Launcher.cs')
 if ($LASTEXITCODE -ne 0) { throw "Échec de la compilation ($LASTEXITCODE)" }
-"Exécutable créé : $out ($([math]::Round((Get-Item $out).Length / 1KB)) Ko)"
+# Si l'ancien exe est en cours d'utilisation, on le renomme (Windows l'autorise) avant de mettre le nouveau
+if (Test-Path -LiteralPath $final) {
+    Remove-Item -LiteralPath "$final.old" -Force -ErrorAction SilentlyContinue
+    try { Remove-Item -LiteralPath $final -Force -ErrorAction Stop } catch { Move-Item -LiteralPath $final -Destination "$final.old" -Force }
+}
+Move-Item -LiteralPath $out -Destination $final
+"Exécutable créé : $final ($([math]::Round((Get-Item $final).Length / 1KB)) Ko)"

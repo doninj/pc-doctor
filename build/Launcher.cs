@@ -18,8 +18,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Diagnostic du PC : lenteurs, plantages, pilotes, espace disque")]
 [assembly: AssemblyCompany("PC Doctor (open source)")]
 [assembly: AssemblyCopyright("Licence MIT")]
-[assembly: AssemblyVersion("2.2.1.0")]
-[assembly: AssemblyFileVersion("2.2.1.0")]
+[assembly: AssemblyVersion("2.3.0.0")]
+[assembly: AssemblyFileVersion("2.3.0.0")]
 
 static class Program {
     [STAThread]
@@ -35,6 +35,7 @@ static class Program {
             // Le texte exécuté vient de l'exe lui-même, pas du fichier copié sur le disque
             string text = new UTF8Encoding(false).GetString(scriptBytes).TrimStart('﻿');
             bool monitor = Array.IndexOf(args, "--monitor") >= 0;
+            bool widget = Array.IndexOf(args, "--widget") >= 0;
 
             InitialSessionState iss = InitialSessionState.CreateDefault();
             using (Runspace rs = RunspaceFactory.CreateRunspace(iss)) {
@@ -47,6 +48,7 @@ static class Program {
                       .AddParameter("LaunchedFrom", scriptPath)
                       .AddParameter("ExePath", Assembly.GetExecutingAssembly().Location);
                     if (monitor) ps.AddParameter("Monitor", true);
+                    else if (widget) ps.AddParameter("Widget", true);
                     ps.Invoke();
                     if (ps.HadErrors && ps.Streams.Error.Count > 0 && !monitor) {
                         Log(ps.Streams.Error);

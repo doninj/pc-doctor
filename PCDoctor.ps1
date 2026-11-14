@@ -3,7 +3,7 @@
     Lancer via "PC Doctor.exe" ou "Lancer PC Doctor.bat".
     Nécessite Windows PowerShell 5.1 (inclus dans Windows 10/11).
 #>
-param([switch]$SelfTest, [string]$LaunchedFrom, [switch]$Monitor, [string]$ExePath)
+param([switch]$SelfTest, [string]$LaunchedFrom, [switch]$Monitor, [switch]$Widget, [string]$ExePath)
 
 $ErrorActionPreference = 'Stop'
 # $LaunchedFrom est fourni quand le script est relancé en administrateur depuis la mémoire (voir Start-ElevatedSelf)
@@ -35,8 +35,247 @@ using System.Windows.Forms;
 using System.Collections.Generic;
 using System.Threading;
 using System.Runtime.InteropServices;
+using System.Management;
+using System.IO.MemoryMappedFiles;
 
 namespace PCDoctor {
+    // ---------------------------------------------------------------------
+    //  Capteurs en direct pour le widget (CPU, GPU, RAM, SSD)
+    // ---------------------------------------------------------------------
+    public class SensorSnapshot {
+        public double Cpu = -1, CpuTemp = -1, Ram = -1, RamUsedGB = -1, RamTotalGB = -1;
+        public double GpuUsage = -1, GpuTemp = -1, GpuPower = -1, GpuPowerLimit = -1, GpuMemUsed = -1, GpuMemTotal = -1, GpuFan = -1, GpuClock = -1;
+        public double DiskBusy = -1, DiskRead = -1, DiskWrite = -1, DiskTemp = -1, DiskUsedPct = -1, DiskFreeGB = -1;
+        public string CpuTempSource = "", DiskTempSource = "", DiskName = "", GpuName = "";
+    }
+
+    public static class LiveSensors {
+        [DllImport("kernel32.dll")] static extern bool GetSystemTimes(out long idle, out long kernel, out long user);
+        [StructLayout(LayoutKind.Sequential)]
+        class MEMSTAT {
+            public uint dwLength; public uint dwMemoryLoad; public ulong ullTotalPhys; public ulong ullAvailPhys;
+            public ulong ullTotalPageFile; public ulong ullAvailPageFile; public ulong ullTotalVirtual; public ulong ullAvailVirtual; public ulong ullAvailExtendedVirtual;
+            public MEMSTAT() { dwLength = (uint)Marshal.SizeOf(typeof(MEMSTAT)); }
+        }
+        [DllImport("kernel32.dll")] static extern bool GlobalMemoryStatusEx([In, Out] MEMSTAT m);
+
+        static long _pi, _pk, _pu;
+        static Process _smi; static volatile string _smiLine; static string _smiPath;
+        static readonly object _lock = new object();
+        static double _diskBusy = -1, _diskRead = -1, _diskWrite = -1, _diskTemp = -1, _cpuTemp = -1;
+        static string _cpuTempSrc = "", _diskTempSrc = "", _diskModel = "", _drive = "C:";
+        static int _diskIndex = -1;
+        static volatile bool _running;
+
+        public static bool CoreTempInstalled() {
+            return File.Exists(CoreTempPath());
+        }
+        public static string CoreTempPath() {
+            string a = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"Core Temp\Core Temp.exe");
+            if (File.Exists(a)) return a;
+            string b = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"Core Temp\Core Temp.exe");
+            return File.Exists(b) ? b : a;
+        }
+
+        public static void Start(string smiPath, string drive) {
+            if (_running) return;
+            _running = true;
+            _drive = string.IsNullOrEmpty(drive) ? "C:" : drive.TrimEnd('\\');
+            _smiPath = smiPath;
+            StartSmi();
+            Thread t = new Thread(Loop);
+            t.IsBackground = true;
+            t.Start();
+        }
+        public static void Stop() {
+            _running = false;
+            try { if (_smi != null && !_smi.HasExited) _smi.Kill(); } catch { }
+        }
+
+        static void StartSmi() {
+            if (string.IsNullOrEmpty(_smiPath) || !File.Exists(_smiPath)) return;
+            try {
+                ProcessStartInfo psi = new ProcessStartInfo(_smiPath, "--query-gpu=name,temperature.gpu,utilization.gpu,power.draw,power.limit,memory.used,memory.total,fan.speed,clocks.gr --format=csv,noheader,nounits -lms 2000");
+                psi.UseShellExecute = false; psi.RedirectStandardOutput = true; psi.CreateNoWindow = true;
+                _smi = Process.Start(psi);
+                _smi.OutputDataReceived += delegate(object s, DataReceivedEventArgs e) { if (e.Data != null && e.Data.IndexOf(',') > 0) _smiLine = e.Data; };
+                _smi.BeginOutputReadLine();
+            } catch { _smi = null; }
+        }
+
+        static void Loop() {
+            FindDisk();
+            DateTime nextDiskTemp = DateTime.MinValue;
+            while (_running) {
+                try { ReadDiskPerf(); } catch { }
+                try { ReadCpuTemp(); } catch { }
+                if (DateTime.Now >= nextDiskTemp) { nextDiskTemp = DateTime.Now.AddSeconds(30); try { ReadDiskTemp(); } catch { } }
+                try { if (_smi != null && _smi.HasExited) { _smi = null; _smiLine = null; StartSmi(); } } catch { }
+                Thread.Sleep(2000);
+            }
+        }
+
+        static void FindDisk() {
+            try {
+                using (ManagementObjectSearcher s = new ManagementObjectSearcher("ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='" + _drive + "'} WHERE AssocClass=Win32_LogicalDiskToPartition"))
+                    foreach (ManagementObject p in s.Get()) { _diskIndex = Convert.ToInt32(p["DiskIndex"]); break; }
+                if (_diskIndex >= 0)
+                    using (ManagementObjectSearcher s2 = new ManagementObjectSearcher("SELECT Model FROM Win32_DiskDrive WHERE Index=" + _diskIndex))
+                        foreach (ManagementObject d in s2.Get()) { _diskModel = Convert.ToString(d["Model"]); break; }
+            } catch { }
+        }
+
+        static void ReadDiskPerf() {
+            using (ManagementObjectSearcher s = new ManagementObjectSearcher("SELECT Name, PercentIdleTime, DiskReadBytesPersec, DiskWriteBytesPersec FROM Win32_PerfFormattedData_PerfDisk_PhysicalDisk")) {
+                foreach (ManagementObject o in s.Get()) {
+                    string name = Convert.ToString(o["Name"]);
+                    if (name == "_Total") continue;
+                    bool match = (_diskIndex >= 0 && name.StartsWith(_diskIndex + " ")) || name.IndexOf(_drive, StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (!match) continue;
+                    double idle = Convert.ToDouble(o["PercentIdleTime"]);
+                    lock (_lock) {
+                        _diskBusy = Math.Max(0, Math.Min(100, 100 - idle));
+                        _diskRead = Convert.ToDouble(o["DiskReadBytesPersec"]);
+                        _diskWrite = Convert.ToDouble(o["DiskWriteBytesPersec"]);
+                    }
+                    break;
+                }
+            }
+        }
+
+        static void ReadDiskTemp() {
+            double t = -1; string src = "";
+            if (_diskIndex >= 0) {
+                try {
+                    ManagementScope scope = new ManagementScope(@"root\Microsoft\Windows\Storage");
+                    using (ManagementObjectSearcher s = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT DeviceId, Temperature FROM MSFT_StorageReliabilityCounter")))
+                        foreach (ManagementObject o in s.Get()) {
+                            if (Convert.ToString(o["DeviceId"]) != _diskIndex.ToString()) continue;
+                            object v = o["Temperature"];
+                            if (v != null && Convert.ToDouble(v) > 0) { t = Convert.ToDouble(v); src = "SMART"; }
+                            break;
+                        }
+                } catch { }
+            }
+            if (t < 0) {
+                foreach (HwReading r in HwinfoAll()) {
+                    if (r.Type == 1 && r.Label.StartsWith("Drive Temperature") && (_diskModel.Length == 0 || r.Sensor.IndexOf(_diskModel, StringComparison.OrdinalIgnoreCase) >= 0)) { t = r.Value; src = "HWiNFO"; break; }
+                }
+            }
+            lock (_lock) { _diskTemp = t; _diskTempSrc = src; }
+        }
+
+        static void ReadCpuTemp() {
+            double t = -1; string src = "";
+            string[] wanted = { "CPU (Tctl/Tdie)", "CPU Package", "CPU (Tctl)", "CPU Die (average)", "Core Max", "CPU" };
+            List<HwReading> hw = HwinfoAll();
+            foreach (string w in wanted) {
+                foreach (HwReading r in hw) { if (r.Type == 1 && r.Label == w && r.Value > 0) { t = r.Value; src = "HWiNFO"; break; } }
+                if (t > 0) break;
+            }
+            if (t <= 0) { t = CoreTemp(); if (t > 0) src = "Core Temp"; }
+            lock (_lock) { _cpuTemp = t > 0 ? t : -1; _cpuTempSrc = src; }
+        }
+
+        static double CoreTemp() {
+            foreach (string name in new string[] { "CoreTempMappingObject", "CoreTempMappingObjectEx" }) {
+                try {
+                    using (MemoryMappedFile mmf = MemoryMappedFile.OpenExisting(name, MemoryMappedFileRights.Read))
+                    using (MemoryMappedViewAccessor a = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read)) {
+                        uint cores = a.ReadUInt32(1536), cpus = a.ReadUInt32(1540);
+                        uint n = Math.Min(256u, Math.Max(1u, cores * Math.Max(1u, cpus)));
+                        uint tj = a.ReadUInt32(1024);
+                        byte fahr = a.ReadByte(2684), delta = a.ReadByte(2685);
+                        double max = -1;
+                        for (int i = 0; i < n; i++) {
+                            double v = a.ReadSingle(1544 + i * 4);
+                            if (delta != 0) v = tj - v;
+                            if (fahr != 0) v = (v - 32) * 5 / 9;
+                            if (v > max) max = v;
+                        }
+                        if (max > 0 && max < 130) return max;
+                    }
+                } catch { }
+            }
+            return -1;
+        }
+
+        struct HwReading { public uint Type; public string Sensor; public string Label; public double Value; }
+        static string Str(MemoryMappedViewAccessor a, long off, int len) {
+            byte[] buf = new byte[len];
+            a.ReadArray(off, buf, 0, len);
+            int z = Array.IndexOf(buf, (byte)0);
+            return Encoding.Default.GetString(buf, 0, z < 0 ? len : z);
+        }
+        // Mémoire partagée de HWiNFO (option « Shared Memory Support »)
+        static List<HwReading> HwinfoAll() {
+            List<HwReading> res = new List<HwReading>();
+            try {
+                using (MemoryMappedFile mmf = MemoryMappedFile.OpenExisting(@"Global\HWiNFO_SENS_SM2", MemoryMappedFileRights.Read))
+                using (MemoryMappedViewAccessor a = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read)) {
+                    if (a.ReadUInt32(0) != 0x53695748) return res;   // "HWiS"
+                    uint offS = a.ReadUInt32(20), sizeS = a.ReadUInt32(24), numS = a.ReadUInt32(28);
+                    uint offR = a.ReadUInt32(32), sizeR = a.ReadUInt32(36), numR = a.ReadUInt32(40);
+                    string[] sensors = new string[Math.Min(numS, 2048u)];
+                    for (uint i = 0; i < sensors.Length; i++) sensors[i] = Str(a, offS + i * sizeS + 8, 128);
+                    for (uint i = 0; i < numR && i < 16384; i++) {
+                        long b = offR + (long)i * sizeR;
+                        HwReading r = new HwReading();
+                        r.Type = a.ReadUInt32(b);
+                        uint si = a.ReadUInt32(b + 4);
+                        r.Label = Str(a, b + 12, 128);
+                        r.Value = a.ReadDouble(b + 284);
+                        r.Sensor = si < sensors.Length ? sensors[si] : "";
+                        res.Add(r);
+                    }
+                }
+            } catch { }
+            return res;
+        }
+
+        static double N(string s) {
+            double d;
+            return double.TryParse(s.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out d) ? d : -1;
+        }
+
+        public static SensorSnapshot Read() {
+            SensorSnapshot s = new SensorSnapshot();
+            long i, k, u;
+            if (GetSystemTimes(out i, out k, out u)) {
+                if (_pk != 0) {
+                    long di = i - _pi, tot = (k - _pk) + (u - _pu);
+                    if (tot > 0) s.Cpu = Math.Max(0, Math.Min(100, 100.0 * (tot - di) / tot));
+                }
+                _pi = i; _pk = k; _pu = u;
+            }
+            MEMSTAT m = new MEMSTAT();
+            if (GlobalMemoryStatusEx(m)) {
+                s.Ram = m.dwMemoryLoad;
+                s.RamTotalGB = m.ullTotalPhys / 1073741824.0;
+                s.RamUsedGB = (m.ullTotalPhys - m.ullAvailPhys) / 1073741824.0;
+            }
+            string line = _smiLine;
+            if (line != null) {
+                string[] v = line.Split(',');
+                if (v.Length >= 9) {
+                    s.GpuName = v[0].Trim(); s.GpuTemp = N(v[1]); s.GpuUsage = N(v[2]); s.GpuPower = N(v[3]); s.GpuPowerLimit = N(v[4]);
+                    s.GpuMemUsed = N(v[5]); s.GpuMemTotal = N(v[6]); s.GpuFan = N(v[7]); s.GpuClock = N(v[8]);
+                }
+            }
+            try {
+                DriveInfo d = new DriveInfo(_drive);
+                if (d.IsReady && d.TotalSize > 0) { s.DiskUsedPct = 100.0 * (d.TotalSize - d.TotalFreeSpace) / d.TotalSize; s.DiskFreeGB = d.TotalFreeSpace / 1073741824.0; }
+            } catch { }
+            lock (_lock) {
+                s.DiskBusy = _diskBusy; s.DiskRead = _diskRead; s.DiskWrite = _diskWrite;
+                s.DiskTemp = _diskTemp; s.DiskTempSource = _diskTempSrc;
+                s.CpuTemp = _cpuTemp; s.CpuTempSource = _cpuTempSrc;
+            }
+            s.DiskName = _diskModel;
+            return s;
+        }
+    }
+
     // ---------------------------------------------------------------------
     //  Boîte noire : enregistre l'état du PC toutes les 2 s (icône de notification)
     // ---------------------------------------------------------------------
@@ -528,12 +767,12 @@ namespace PCDoctor {
     }
 }
 '@
-if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp -Language CSharp -ReferencedAssemblies System.Windows.Forms, System.Drawing }
+if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp -Language CSharp -ReferencedAssemblies System.Windows.Forms, System.Drawing, System.Management, System.Core }
 
 # ---------------------------------------------------------------------------
 #  Réglages partagés (appli + boîte noire) : %LOCALAPPDATA%\PCDoctor\settings.ini
 # ---------------------------------------------------------------------------
-$script:AppVersion = '2.2.1'
+$script:AppVersion = '2.3.0'
 $script:Repo = 'doninj/pc-doctor'
 $script:SettingsFile = Join-Path $script:LogDir 'settings.ini'
 $script:BlackBoxDir = Join-Path $script:LogDir 'boite-noire'
@@ -558,12 +797,12 @@ function Set-Setting([string]$key, [string]$value) {
 }
 
 # Comment relancer PC Doctor (depuis l'exe ou depuis le script)
-function Get-LaunchCommand([switch]$Monitor) {
+function Get-LaunchCommand([switch]$Monitor, [switch]$Widget) {
     if ($ExePath -and (Test-Path -LiteralPath $ExePath)) {
-        return @{ Exe = $ExePath; Args = $(if ($Monitor) { '--monitor' } else { '' }) }
+        return @{ Exe = $ExePath; Args = $(if ($Monitor) { '--monitor' } elseif ($Widget) { '--widget' } else { '' }) }
     }
     $a = "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$script:ScriptPath`""
-    if ($Monitor) { $a += ' -Monitor' }
+    if ($Monitor) { $a += ' -Monitor' } elseif ($Widget) { $a += ' -Widget' }
     return @{ Exe = $script:PowerShellExe; Args = $a }
 }
 
@@ -580,6 +819,308 @@ if ($Monitor) {
     $smi = @((Join-Path $script:Sys32 'nvidia-smi.exe'), (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'NVIDIA Corporation\NVSMI\nvidia-smi.exe')) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     $open = Get-LaunchCommand
     [void][PCDoctor.BlackBox]::Run($script:BlackBoxDir, $script:SettingsFile, $open.Exe, $open.Args, (Get-LogoPng), [string]$smi)
+    return
+}
+
+# ---------------------------------------------------------------------------
+#  Widget de bureau : températures et utilisation en direct
+# ---------------------------------------------------------------------------
+$widgetXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="PC Doctor - Widget" Width="300" SizeToContent="Height" WindowStyle="None" AllowsTransparency="True"
+        Background="Transparent" ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True"
+        FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="12" UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
+  <Window.Resources>
+    <FontFamily x:Key="Icons">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
+    <Style TargetType="ProgressBar">
+      <Setter Property="Height" Value="4"/>
+      <Setter Property="Maximum" Value="100"/>
+      <Setter Property="Background" Value="#26FFFFFF"/>
+      <Setter Property="Foreground" Value="#FF5B8CFF"/>
+      <Setter Property="Margin" Value="0,7,0,0"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ProgressBar">
+            <Grid>
+              <Border x:Name="PART_Track" Background="{TemplateBinding Background}" CornerRadius="2"/>
+              <Border x:Name="PART_Indicator" Background="{TemplateBinding Foreground}" CornerRadius="2" HorizontalAlignment="Left"/>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="Label" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#FFAAB4C5"/>
+      <Setter Property="FontSize" Value="12"/>
+    </Style>
+    <Style x:Key="Sub" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#FF7D889B"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+      <Setter Property="Margin" Value="0,1,0,0"/>
+    </Style>
+    <Style x:Key="Value" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="FontSize" Value="19"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="FontFamily" Value="Segoe UI Variable Display, Segoe UI"/>
+    </Style>
+    <Style x:Key="Icon" TargetType="TextBlock">
+      <Setter Property="FontFamily" Value="{StaticResource Icons}"/>
+      <Setter Property="FontSize" Value="15"/>
+      <Setter Property="Width" Value="26"/>
+      <Setter Property="Margin" Value="0,2,0,0"/>
+      <Setter Property="VerticalAlignment" Value="Top"/>
+    </Style>
+    <Style x:Key="Pill" TargetType="Border">
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="7,1"/>
+      <Setter Property="Margin" Value="8,4,0,0"/>
+      <Setter Property="VerticalAlignment" Value="Top"/>
+      <Setter Property="Background" Value="#22FFFFFF"/>
+    </Style>
+    <Style x:Key="PillText" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="11.5"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Foreground" Value="#FFAAB4C5"/>
+    </Style>
+  </Window.Resources>
+
+  <Border x:Name="Root" CornerRadius="16" BorderBrush="#30FFFFFF" BorderThickness="1" Padding="16,12,16,14" Margin="8">
+    <Border.Background>
+      <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Color="#F2161D2E" Offset="0"/>
+        <GradientStop Color="#F20D121D" Offset="1"/>
+      </LinearGradientBrush>
+    </Border.Background>
+    <Border.Effect><DropShadowEffect BlurRadius="16" ShadowDepth="3" Direction="270" Opacity="0.45"/></Border.Effect>
+    <StackPanel>
+      <DockPanel Margin="0,0,0,4">
+        <TextBlock x:Name="WClose" DockPanel.Dock="Right" Text="&#xE711;" FontFamily="{StaticResource Icons}" FontSize="10" Foreground="#FF7D889B" Cursor="Hand" VerticalAlignment="Center" Padding="6,4,0,4" ToolTip="Fermer le widget"/>
+        <TextBlock x:Name="WPin" DockPanel.Dock="Right" Text="&#xE718;" FontFamily="{StaticResource Icons}" FontSize="11" Foreground="#FF5B8CFF" Cursor="Hand" VerticalAlignment="Center" Padding="6,4" ToolTip="Toujours au premier plan"/>
+        <Image x:Name="WLogo" Width="16" Height="16" Margin="0,0,8,0" VerticalAlignment="Center"/>
+        <TextBlock Text="PC Doctor" Foreground="#FFE6EAF2" FontWeight="SemiBold" VerticalAlignment="Center"/>
+        <TextBlock x:Name="WClock" Foreground="#FF7D889B" Margin="8,0,0,0" VerticalAlignment="Center"/>
+      </DockPanel>
+
+      <StackPanel Margin="0,12,0,0">
+        <DockPanel>
+          <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+            <TextBlock x:Name="WCpu" Text="—" Style="{StaticResource Value}"/>
+            <Border x:Name="WCpuTempPill" Style="{StaticResource Pill}" Cursor="Hand"><TextBlock x:Name="WCpuTemp" Text="— °C" Style="{StaticResource PillText}"/></Border>
+          </StackPanel>
+          <TextBlock Text="&#xE950;" Style="{StaticResource Icon}" Foreground="#FF5B8CFF" VerticalAlignment="Center" Margin="0"/>
+          <TextBlock Text="Processeur" Style="{StaticResource Label}" VerticalAlignment="Center"/>
+        </DockPanel>
+        <TextBlock x:Name="WCpuSub" Style="{StaticResource Sub}" Margin="26,0,0,0"/>
+        <ProgressBar x:Name="WCpuBar" Margin="26,6,0,0"/>
+      </StackPanel>
+      <StackPanel Margin="0,12,0,0">
+        <DockPanel>
+          <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+            <TextBlock x:Name="WGpu" Text="—" Style="{StaticResource Value}"/>
+            <Border x:Name="WGpuTempPill" Style="{StaticResource Pill}"><TextBlock x:Name="WGpuTemp" Text="— °C" Style="{StaticResource PillText}"/></Border>
+          </StackPanel>
+          <TextBlock Text="&#xE7F4;" Style="{StaticResource Icon}" Foreground="#FFA78BFA" VerticalAlignment="Center" Margin="0"/>
+          <TextBlock Text="Carte graphique" Style="{StaticResource Label}" VerticalAlignment="Center"/>
+        </DockPanel>
+        <TextBlock x:Name="WGpuSub" Style="{StaticResource Sub}" Margin="26,0,0,0"/>
+        <ProgressBar x:Name="WGpuBar" Foreground="#FFA78BFA" Margin="26,6,0,0"/>
+      </StackPanel>
+      <StackPanel Margin="0,12,0,0">
+        <DockPanel>
+          <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+            <TextBlock x:Name="WRam" Text="—" Style="{StaticResource Value}"/>
+          </StackPanel>
+          <TextBlock Text="&#xEEA0;" Style="{StaticResource Icon}" Foreground="#FF34D399" VerticalAlignment="Center" Margin="0"/>
+          <TextBlock Text="Mémoire vive" Style="{StaticResource Label}" VerticalAlignment="Center"/>
+        </DockPanel>
+        <TextBlock x:Name="WRamSub" Style="{StaticResource Sub}" Margin="26,0,0,0"/>
+        <ProgressBar x:Name="WRamBar" Foreground="#FF34D399" Margin="26,6,0,0"/>
+      </StackPanel>
+      <StackPanel Margin="0,12,0,0">
+        <DockPanel>
+          <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+            <TextBlock x:Name="WDisk" Text="—" Style="{StaticResource Value}"/>
+            <Border x:Name="WDiskTempPill" Style="{StaticResource Pill}"><TextBlock x:Name="WDiskTemp" Text="— °C" Style="{StaticResource PillText}"/></Border>
+          </StackPanel>
+          <TextBlock Text="&#xEDA2;" Style="{StaticResource Icon}" Foreground="#FFFBBF24" VerticalAlignment="Center" Margin="0"/>
+          <TextBlock x:Name="WDiskTitle" Text="SSD" Style="{StaticResource Label}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+        </DockPanel>
+        <TextBlock x:Name="WDiskSub" Style="{StaticResource Sub}" Margin="26,0,0,0"/>
+        <ProgressBar x:Name="WDiskBar" Foreground="#FFFBBF24" Margin="26,6,0,0"/>
+      </StackPanel>
+      <!-- Historique -->
+      <Border Background="#14FFFFFF" CornerRadius="10" Padding="10,8" Margin="0,14,0,0">
+        <StackPanel>
+          <DockPanel>
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+              <Ellipse Width="7" Height="7" Fill="#FF5B8CFF" VerticalAlignment="Center"/><TextBlock Text="CPU" Style="{StaticResource Sub}" Margin="4,0,10,0" VerticalAlignment="Center"/>
+              <Ellipse Width="7" Height="7" Fill="#FFA78BFA" VerticalAlignment="Center"/><TextBlock Text="GPU" Style="{StaticResource Sub}" Margin="4,0,0,0" VerticalAlignment="Center"/>
+            </StackPanel>
+            <TextBlock Text="2 dernières minutes" Style="{StaticResource Sub}" Margin="0"/>
+          </DockPanel>
+          <Canvas x:Name="WHistory" Height="38" Margin="0,6,0,0" ClipToBounds="True"/>
+        </StackPanel>
+      </Border>
+    </StackPanel>
+  </Border>
+</Window>
+'@
+
+function New-WidgetWindow {
+    [xml]$x = $widgetXaml
+    $w = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+    $map = @{}
+    foreach ($m in [regex]::Matches($widgetXaml, 'x:Name="(\w+)"')) { $el = $w.FindName($m.Groups[1].Value); if ($el) { $map[$m.Groups[1].Value] = $el } }
+    $logo = Get-LogoPng
+    if ($logo) { try { $src = [System.Windows.Media.Imaging.BitmapFrame]::Create((New-Object Uri $logo)); $map['WLogo'].Source = $src; $w.Icon = $src } catch {} }
+    @{ Window = $w; UI = $map }
+}
+
+$script:WBrush = New-Object System.Windows.Media.BrushConverter
+function Get-WBrush([string]$hex) { $script:WBrush.ConvertFromString($hex) }
+function Set-WTemp($pill, $text, [double]$t, [double]$warn, [double]$hot, [string]$tip) {
+    if ($t -le 0) {
+        $text.Text = '— °C'; $text.Foreground = Get-WBrush '#FF7D889B'; $pill.Background = Get-WBrush '#22FFFFFF'
+        $pill.ToolTip = $tip
+        return
+    }
+    $text.Text = "{0:N0} °C" -f $t
+    $c = if ($t -ge $hot) { @('#FFF87171', '#33F87171') } elseif ($t -ge $warn) { @('#FFFBBF24', '#33FBBF24') } else { @('#FF4ADE80', '#2622C55E') }
+    $text.Foreground = Get-WBrush $c[0]; $pill.Background = Get-WBrush $c[1]
+    $pill.ToolTip = $null
+}
+function Format-Rate([double]$b) { if ($b -lt 0) { '—' } elseif ($b -ge 1MB) { '{0:N1} Mo/s' -f ($b / 1MB) } else { '{0:N0} Ko/s' -f ($b / 1KB) } }
+
+$script:WHistCpu = New-Object System.Collections.Generic.List[double]
+$script:WHistGpu = New-Object System.Collections.Generic.List[double]
+function Update-Widget($u, $s) {
+    $u.WClock.Text = (Get-Date).ToString('HH:mm')
+    # Processeur
+    $u.WCpu.Text = if ($s.Cpu -ge 0) { "{0:N0} %" -f $s.Cpu } else { '—' }
+    $u.WCpuBar.Value = [math]::Max(0, $s.Cpu)
+    $ctTip = if ([PCDoctor.LiveSensors]::CoreTempInstalled()) { 'Température indisponible : cliquez pour lancer Core Temp (déjà installé), le widget la lira automatiquement.' } else { 'Windows ne donne pas la température du processeur : lancez HWiNFO (option « Shared Memory Support ») ou Core Temp, le widget la lira automatiquement.' }
+    Set-WTemp $u.WCpuTempPill $u.WCpuTemp $s.CpuTemp 70 85 $ctTip
+    $u.WCpuSub.Text = if ($s.CpuTemp -gt 0) { "Température via $($s.CpuTempSource)" } else { 'Température : lancez Core Temp' }
+    # Carte graphique
+    if ($s.GpuUsage -ge 0) {
+        $u.WGpu.Text = "{0:N0} %" -f $s.GpuUsage
+        $u.WGpuBar.Value = $s.GpuUsage
+        $parts = @()
+        if ($s.GpuPower -ge 0) { $parts += "{0:N0} W" -f $s.GpuPower }
+        if ($s.GpuMemTotal -gt 0) { $parts += "VRAM {0:N1}/{1:N0} Go" -f ($s.GpuMemUsed / 1024), ($s.GpuMemTotal / 1024) }
+        if ($s.GpuFan -ge 0) { $parts += "ventilo {0:N0} %" -f $s.GpuFan }
+        $u.WGpuSub.Text = $parts -join '  ·  '
+    } else { $u.WGpu.Text = '—'; $u.WGpuSub.Text = 'Suivi disponible pour les cartes NVIDIA' }
+    Set-WTemp $u.WGpuTempPill $u.WGpuTemp $s.GpuTemp 75 85 'Température indisponible'
+    # Mémoire
+    $u.WRam.Text = if ($s.Ram -ge 0) { "{0:N0} %" -f $s.Ram } else { '—' }
+    $u.WRamBar.Value = [math]::Max(0, $s.Ram)
+    $u.WRamBar.Foreground = Get-WBrush $(if ($s.Ram -ge 90) { '#FFF87171' } elseif ($s.Ram -ge 80) { '#FFFBBF24' } else { '#FF34D399' })
+    $u.WRamSub.Text = if ($s.RamTotalGB -gt 0) { "{0:N1} Go utilisés sur {1:N0} Go" -f $s.RamUsedGB, $s.RamTotalGB } else { '' }
+    # SSD
+    $u.WDiskTitle.Text = "$(if ($s.DiskName -match 'SSD|NVMe') { 'SSD' } else { 'Disque' }) $($env:SystemDrive)"
+    $u.WDiskTitle.ToolTip = $s.DiskName
+    $u.WDisk.Text = if ($s.DiskBusy -ge 0) { "{0:N0} %" -f $s.DiskBusy } else { '—' }
+    $u.WDiskBar.Value = [math]::Max(0, $s.DiskBusy)
+    $u.WDiskSub.Text = "L {0}  ·  É {1}  ·  {2:N0} % plein" -f (Format-Rate $s.DiskRead), (Format-Rate $s.DiskWrite), [math]::Max(0, $s.DiskUsedPct)
+    Set-WTemp $u.WDiskTempPill $u.WDiskTemp $s.DiskTemp 55 65 'Température du SSD : ouvrez le widget depuis PC Doctor en mode administrateur, ou lancez HWiNFO.'
+    # Historique (60 points = 2 minutes)
+    foreach ($pair in @(@($script:WHistCpu, $s.Cpu), @($script:WHistGpu, $s.GpuUsage))) {
+        $pair[0].Add([math]::Max(0, [double]$pair[1])); while ($pair[0].Count -gt 60) { $pair[0].RemoveAt(0) }
+    }
+    $cv = $u.WHistory
+    $cv.Children.Clear()
+    $wd = if ($cv.ActualWidth -gt 20) { $cv.ActualWidth } else { 236 }
+    $h = $cv.Height
+    foreach ($serie in @(@($script:WHistGpu, '#FFA78BFA'), @($script:WHistCpu, '#FF5B8CFF'))) {
+        $pts = $serie[0]
+        if ($pts.Count -lt 2) { continue }
+        $poly = New-Object System.Windows.Shapes.Polyline
+        $poly.Stroke = Get-WBrush $serie[1]; $poly.StrokeThickness = 1.6; $poly.StrokeLineJoin = 'Round'
+        for ($i = 0; $i -lt $pts.Count; $i++) {
+            $x = $wd - ($pts.Count - 1 - $i) * ($wd / 59)
+            [void]$poly.Points.Add((New-Object System.Windows.Point($x, ($h - 1 - [math]::Min(100, $pts[$i]) / 100 * ($h - 2)))))
+        }
+        [void]$cv.Children.Add($poly)
+    }
+}
+
+if ($Widget) {
+    $wMutex = New-Object System.Threading.Mutex($false, 'Local\PCDoctorWidget')
+    if (-not $wMutex.WaitOne(0)) { return }   # déjà ouvert
+    try {
+        $smi = @((Join-Path $script:Sys32 'nvidia-smi.exe'), (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'NVIDIA Corporation\NVSMI\nvidia-smi.exe')) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        [PCDoctor.LiveSensors]::Start([string]$smi, $env:SystemDrive)
+        $wb = New-WidgetWindow
+        $ww = $wb.Window; $wu = $wb.UI
+        $cfg = Get-Settings
+
+        # Position et réglages mémorisés
+        $wa = [System.Windows.SystemParameters]::WorkArea
+        $left = 0.0; $top = 0.0
+        $okPos = [double]::TryParse([string]$cfg['WidgetLeft'], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$left) -and [double]::TryParse([string]$cfg['WidgetTop'], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$top)
+        $vs = @([System.Windows.SystemParameters]::VirtualScreenLeft, [System.Windows.SystemParameters]::VirtualScreenTop, [System.Windows.SystemParameters]::VirtualScreenWidth, [System.Windows.SystemParameters]::VirtualScreenHeight)
+        if (-not $okPos -or $left -lt $vs[0] - 50 -or $top -lt $vs[1] - 50 -or $left -gt $vs[0] + $vs[2] - 100 -or $top -gt $vs[1] + $vs[3] - 100) { $left = $wa.Right - 306 - 16; $top = $wa.Top + 16 }
+        $ww.Left = $left; $ww.Top = $top
+        $ww.Topmost = ($cfg['WidgetTopmost'] -ne '0')
+        $op = 1.0; if ([double]::TryParse([string]$cfg['WidgetOpacity'], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$op)) { $ww.Opacity = [math]::Max(0.4, [math]::Min(1, $op)) }
+
+        function Save-WidgetPos { try { $inv = [Globalization.CultureInfo]::InvariantCulture; Set-Setting 'WidgetLeft' $ww.Left.ToString($inv); Set-Setting 'WidgetTop' $ww.Top.ToString($inv) } catch {} }
+        function Update-PinIcon { $wu.WPin.Foreground = Get-WBrush $(if ($ww.Topmost) { '#FF5B8CFF' } else { '#FF7D889B' }); $wu.WPin.ToolTip = if ($ww.Topmost) { 'Toujours au premier plan (cliquer pour désactiver)' } else { 'Cliquer pour garder le widget au premier plan' } }
+        function Set-WidgetTopmost([bool]$on) { $ww.Topmost = $on; Set-Setting 'WidgetTopmost' $(if ($on) { '1' } else { '0' }); Update-PinIcon; $script:MiTop.IsChecked = $on }
+        Update-PinIcon
+
+        # Déplacement à la souris
+        $wu.Root.Add_MouseLeftButtonDown({
+                param($s, $e)
+                $src = $e.OriginalSource
+                if (@($wu.WClose, $wu.WPin, $wu.WCpuTemp, $wu.WCpuTempPill) -contains $src) { return }   # boutons du widget
+                if ($e.ClickCount -eq 1) { try { $ww.DragMove() } catch {}; Save-WidgetPos }
+            })
+        $wu.WClose.Add_MouseLeftButtonUp({ $ww.Close() })
+        $wu.WPin.Add_MouseLeftButtonUp({ Set-WidgetTopmost (-not $ww.Topmost) })
+        $wu.WCpuTempPill.Add_MouseLeftButtonUp({
+                if ([PCDoctor.LiveSensors]::Read().CpuTemp -le 0 -and [PCDoctor.LiveSensors]::CoreTempInstalled()) { try { Start-Process -FilePath ([PCDoctor.LiveSensors]::CoreTempPath()) } catch {} }
+            })
+
+        # Menu clic droit
+        $menu = New-Object System.Windows.Controls.ContextMenu
+        $script:MiTop = New-Object System.Windows.Controls.MenuItem
+        $script:MiTop.Header = 'Toujours au premier plan'; $script:MiTop.IsCheckable = $true; $script:MiTop.IsChecked = $ww.Topmost
+        $script:MiTop.Add_Click({ Set-WidgetTopmost $script:MiTop.IsChecked })
+        [void]$menu.Items.Add($script:MiTop)
+        $miOp = New-Object System.Windows.Controls.MenuItem; $miOp.Header = 'Opacité'
+        foreach ($v in 100, 90, 80, 70, 60) {
+            $it = New-Object System.Windows.Controls.MenuItem; $it.Header = "$v %"; $it.Tag = $v / 100
+            $it.Add_Click({ param($s, $e) $ww.Opacity = [double]$s.Tag; Set-Setting 'WidgetOpacity' ([double]$s.Tag).ToString([Globalization.CultureInfo]::InvariantCulture) })
+            [void]$miOp.Items.Add($it)
+        }
+        [void]$menu.Items.Add($miOp)
+        [void]$menu.Items.Add((New-Object System.Windows.Controls.Separator))
+        $miOpen = New-Object System.Windows.Controls.MenuItem; $miOpen.Header = 'Ouvrir PC Doctor'
+        $miOpen.Add_Click({ $c = Get-LaunchCommand; $psi = New-Object Diagnostics.ProcessStartInfo($c.Exe, $c.Args); $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; [void][Diagnostics.Process]::Start($psi) })
+        [void]$menu.Items.Add($miOpen)
+        $miClose = New-Object System.Windows.Controls.MenuItem; $miClose.Header = 'Fermer le widget'
+        $miClose.Add_Click({ $ww.Close() })
+        [void]$menu.Items.Add($miClose)
+        $wu.Root.ContextMenu = $menu
+
+        [void][PCDoctor.LiveSensors]::Read()
+        $wTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $wTimer.Interval = [TimeSpan]::FromSeconds(2)
+        $wTimer.Add_Tick({ try { Update-Widget $wu ([PCDoctor.LiveSensors]::Read()) } catch { Write-Log "Widget : $_" } })
+        $ww.Add_ContentRendered({ try { Update-Widget $wu ([PCDoctor.LiveSensors]::Read()) } catch {}; $wTimer.Start() })
+        $ww.Add_Closing({ $wTimer.Stop(); Save-WidgetPos })
+        [void]$ww.ShowDialog()
+    } catch {
+        Write-Log "Widget : $_ $($_.ScriptStackTrace)"
+    } finally {
+        [PCDoctor.LiveSensors]::Stop()
+        $wMutex.ReleaseMutex()
+    }
     return
 }
 
@@ -2010,6 +2551,9 @@ $xamlText = @'
                 <Button x:Name="BtnAnalyze" DockPanel.Dock="Right" VerticalAlignment="Top" Margin="0">
                   <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE72C;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Relancer l'analyse"/></StackPanel>
                 </Button>
+                <Button x:Name="BtnWidgetDiag" DockPanel.Dock="Right" VerticalAlignment="Top" Style="{StaticResource Secondary}" Margin="0,0,8,0" ToolTip="Petit widget de bureau : températures et utilisation en direct">
+                  <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE7C4;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Widget"/></StackPanel>
+                </Button>
                 <StackPanel>
                   <TextBlock Style="{StaticResource PageTitle}" Text="Diagnostic"/>
                   <TextBlock x:Name="TxtSysInfo" Style="{StaticResource PageSub}" Text="Analyse en cours…"/>
@@ -2460,7 +3004,12 @@ $xamlText = @'
         <TabItem>
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="PerfRoot" Margin="32,28,32,24">
-              <TextBlock Style="{StaticResource PageTitle}" Text="Performances et overclocking"/>
+              <DockPanel>
+                <Button DockPanel.Dock="Right" Tag="widget-open" VerticalAlignment="Top" Margin="0">
+                  <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE7C4;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Ouvrir le widget"/></StackPanel>
+                </Button>
+                <TextBlock Style="{StaticResource PageTitle}" Text="Performances et overclocking"/>
+              </DockPanel>
               <TextBlock Style="{StaticResource PageSub}" Text="Voyez ce qui est overclocké sur votre PC et testez la stabilité directement d'ici. Tous les réglages sont réversibles."/>
               <Grid Margin="0,18,0,0">
                 <Grid.ColumnDefinitions>
@@ -3018,6 +3567,19 @@ $xamlText = @'
               </Border>
               <Border Style="{StaticResource Card}" Margin="0,0,0,14">
                 <StackPanel>
+                  <TextBlock Text="Widget de bureau" FontSize="16" FontWeight="SemiBold"/>
+                  <TextBlock Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,4,0,10" Text="Une petite fenêtre qui affiche en direct l'utilisation et la température du processeur, de la carte graphique, de la RAM et du SSD. Déplacez-la à la souris, clic droit pour l'opacité et le premier plan."/>
+                  <CheckBox x:Name="ChkWidgetAutostart" Content="Afficher le widget au démarrage de Windows"/>
+                  <WrapPanel Margin="0,10,0,0">
+                    <Button Tag="widget-open" Margin="0,0,8,6">
+                      <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE7C4;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Ouvrir le widget"/></StackPanel>
+                    </Button>
+                  </WrapPanel>
+                  <TextBlock Style="{StaticResource MutedText}" FontSize="12" TextWrapping="Wrap" Margin="0,6,0,0" Text="Température du processeur : Windows ne la fournit pas pour tous les processeurs. Le widget la lit automatiquement si Core Temp ou HWiNFO (option « Shared Memory Support ») est lancé. Température du SSD : ouvrez le widget depuis PC Doctor en mode administrateur."/>
+                </StackPanel>
+              </Border>
+              <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+                <StackPanel>
                   <TextBlock Text="Mises à jour de PC Doctor" FontSize="16" FontWeight="SemiBold"/>
                   <TextBlock x:Name="TxtAppVersion" Style="{StaticResource MutedText}" Margin="0,4,0,4"/>
                   <TextBlock x:Name="TxtUpdateStatus" TextWrapping="Wrap" Margin="0,0,0,10"/>
@@ -3280,6 +3842,7 @@ if (`$h -ne '$hash') { Add-Type -AssemblyName PresentationFramework; [void][Syst
             'chipset' { Start-Process 'https://www.amd.com/fr/support/download/drivers.html' }
             'fastboot-off' { Set-FastStartup $false }
             'fastboot-on' { Set-FastStartup $true }
+            'widget-open' { Open-Widget }
             'bb-start' {
                 Start-BlackBox
                 Set-BlackBoxAutostart $true
@@ -4346,7 +4909,13 @@ Read-Host 'Appuyez sur Entree pour fermer'
                 return
             }
             try {
-                Move-Item -LiteralPath $script:UpdateTmp -Destination $ExePath -Force
+                # L'exe est en cours d'utilisation (l'appli tourne dedans) : Windows interdit de l'écraser
+                # mais autorise à le renommer. On le met de côté, puis on place le nouveau à sa place.
+                $old = "$ExePath.old"
+                Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+                Move-Item -LiteralPath $ExePath -Destination $old -Force
+                try { Move-Item -LiteralPath $script:UpdateTmp -Destination $ExePath -Force }
+                catch { Move-Item -LiteralPath $old -Destination $ExePath -Force; throw }
                 if ([PCDoctor.BlackBox]::IsRunning()) { [void][PCDoctor.BlackBox]::RequestStop(); Start-Sleep -Milliseconds 2500; Start-BlackBox }
                 Start-Process -FilePath $ExePath
                 $window.Close()
@@ -4361,8 +4930,33 @@ Read-Host 'Appuyez sur Entree pour fermer'
     $ui.BtnInstallUpdate.Add_Click({ Install-Update })
     $ui.BtnCheckUpdate.Add_Click({ Start-UpdateCheck $true })
 
+    # --- Widget de bureau ---
+    $script:WidgetRunName = 'PCDoctorWidget'
+    function Open-Widget {
+        $c = Get-LaunchCommand -Widget
+        $psi = New-Object Diagnostics.ProcessStartInfo($c.Exe, $c.Args)
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        [void][Diagnostics.Process]::Start($psi)
+        Set-Status 'Widget ouvert : déplacez-le à la souris, clic droit pour ses réglages.'
+    }
+    function Test-WidgetAutostart { try { return [bool](Get-ItemProperty -LiteralPath $script:RunKey -Name $script:WidgetRunName -ErrorAction Stop).$($script:WidgetRunName) } catch { return $false } }
+    function Set-WidgetAutostart([bool]$on) {
+        if ($on) {
+            $c = Get-LaunchCommand -Widget
+            New-ItemProperty -LiteralPath $script:RunKey -Name $script:WidgetRunName -Value ("`"{0}`" {1}" -f $c.Exe, $c.Args).Trim() -PropertyType String -Force | Out-Null
+        } else { Remove-ItemProperty -LiteralPath $script:RunKey -Name $script:WidgetRunName -ErrorAction SilentlyContinue }
+    }
+    $ui.BtnWidgetDiag.Add_Click({ Open-Widget })
+    $ui.ChkWidgetAutostart.Add_Checked({ if (-not $script:Loading) { Set-WidgetAutostart $true; Set-Status 'Le widget s''affichera au démarrage de Windows.' } })
+    $ui.ChkWidgetAutostart.Add_Unchecked({ if (-not $script:Loading) { Set-WidgetAutostart $false; Set-Status 'Le widget ne s''affichera plus au démarrage.' } })
+
+    # Ancienne version mise de côté lors d'une mise à jour : on la supprime (si plus rien ne l'utilise)
+    if ($ExePath) { Remove-Item -LiteralPath "$ExePath.old" -Force -ErrorAction SilentlyContinue }
+
     # --- État initial des réglages ---
     $cfg = Get-Settings
+    $ui.ChkWidgetAutostart.IsChecked = Test-WidgetAutostart
+    if (Test-WidgetAutostart) { try { Set-WidgetAutostart $true } catch {} }
     $ui.TxtAppVersion.Text = "Version installée : $($script:AppVersion)"
     $ui.TxtVersion.Text = "PC Doctor $($script:AppVersion)"
     $ui.TxtThemeInfo.Text = if ($script:IsDark) { 'Thème sombre activé. Changer de thème relance l''appli.' } else { 'Thème clair activé. Changer de thème relance l''appli.' }
