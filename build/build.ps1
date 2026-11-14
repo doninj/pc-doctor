@@ -7,7 +7,10 @@ if (-not (Test-Path $csc)) { $csc = Join-Path $env:windir 'Microsoft.NET\Framewo
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'make-icon.ps1') | Out-Null
 
 $out = Join-Path $root 'PC Doctor.exe'
+# Moteur PowerShell de Windows (Windows PowerShell 5.1), intégré dans le processus de l'exe
+$sma = [System.Management.Automation.PSObject].Assembly.Location
 & $csc /nologo /target:winexe /optimize+ /platform:anycpu `
+    "/reference:$sma" `
     "/out:$out" `
     "/win32icon:$(Join-Path $PSScriptRoot 'PCDoctor.ico')" `
     "/resource:$(Join-Path $root 'PCDoctor.ps1'),PCDoctor.ps1" `

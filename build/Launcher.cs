@@ -1,16 +1,25 @@
-﻿// Lanceur de PC Doctor : contient le script et le logo, les extrait dans
-// %LOCALAPPDATA%\PCDoctor\app puis démarre l'interface sans fenêtre console.
+﻿// Lanceur de PC Doctor.
+// Le script PowerShell est intégré à l'exe et exécuté directement à l'intérieur du processus
+// (moteur PowerShell de Windows) : aucun powershell.exe caché, aucun contournement de la
+// stratégie d'exécution. Le script et le logo sont aussi copiés dans %LOCALAPPDATA%\PCDoctor\app
+// (le logo sert à l'interface ; le script n'est jamais relu depuis le disque par l'exe).
 using System;
-using System.Diagnostics;
+using System.Collections.ObjectModel;
 using System.IO;
+using System.Management.Automation;
+using System.Management.Automation.Runspaces;
 using System.Reflection;
+using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("PC Doctor")]
 [assembly: AssemblyProduct("PC Doctor")]
 [assembly: AssemblyDescription("Diagnostic du PC : lenteurs, plantages, pilotes, espace disque")]
-[assembly: AssemblyVersion("2.2.0.0")]
-[assembly: AssemblyFileVersion("2.2.0.0")]
+[assembly: AssemblyCompany("PC Doctor (open source)")]
+[assembly: AssemblyCopyright("Licence MIT")]
+[assembly: AssemblyVersion("2.2.1.0")]
+[assembly: AssemblyFileVersion("2.2.1.0")]
 
 static class Program {
     [STAThread]
@@ -18,20 +27,32 @@ static class Program {
         try {
             string dir = Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PCDoctor"), "app");
             Directory.CreateDirectory(dir);
-            string script = Path.Combine(dir, "PCDoctor.ps1");
-            Extract("PCDoctor.ps1", script);
-            Extract("PCDoctor.png", Path.Combine(dir, "PCDoctor.png"));
+            string scriptPath = Path.Combine(dir, "PCDoctor.ps1");
+            byte[] scriptBytes = Resource("PCDoctor.ps1");
+            Save(scriptBytes, scriptPath);
+            Save(Resource("PCDoctor.png"), Path.Combine(dir, "PCDoctor.png"));
 
-            string ps = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
-            string self = Assembly.GetExecutingAssembly().Location;
-            bool monitor = Array.IndexOf(args, "--monitor") >= 0;   // boîte noire (icône de notification, sans fenêtre)
-            string psArgs = "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File \"" + script + "\" -ExePath \"" + self + "\"";
-            if (monitor) psArgs += " -Monitor";
-            ProcessStartInfo psi = new ProcessStartInfo(ps, psArgs);
-            psi.UseShellExecute = false;
-            psi.CreateNoWindow = true;
-            psi.WorkingDirectory = dir;
-            Process.Start(psi);
+            // Le texte exécuté vient de l'exe lui-même, pas du fichier copié sur le disque
+            string text = new UTF8Encoding(false).GetString(scriptBytes).TrimStart('﻿');
+            bool monitor = Array.IndexOf(args, "--monitor") >= 0;
+
+            InitialSessionState iss = InitialSessionState.CreateDefault();
+            using (Runspace rs = RunspaceFactory.CreateRunspace(iss)) {
+                rs.ApartmentState = ApartmentState.STA;
+                rs.ThreadOptions = PSThreadOptions.UseCurrentThread;
+                rs.Open();
+                using (PowerShell ps = PowerShell.Create()) {
+                    ps.Runspace = rs;
+                    ps.AddScript(text)
+                      .AddParameter("LaunchedFrom", scriptPath)
+                      .AddParameter("ExePath", Assembly.GetExecutingAssembly().Location);
+                    if (monitor) ps.AddParameter("Monitor", true);
+                    ps.Invoke();
+                    if (ps.HadErrors && ps.Streams.Error.Count > 0 && !monitor) {
+                        Log(ps.Streams.Error);
+                    }
+                }
+            }
             return 0;
         } catch (Exception ex) {
             MessageBox.Show("PC Doctor n'a pas pu démarrer :\n\n" + ex.Message, "PC Doctor", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -39,9 +60,9 @@ static class Program {
         }
     }
 
-    static void Extract(string name, string path) {
+    static byte[] Resource(string name) {
         using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream(name)) {
-            if (s == null) return;
+            if (s == null) return new byte[0];
             byte[] data = new byte[s.Length];
             int read = 0;
             while (read < data.Length) {
@@ -49,6 +70,13 @@ static class Program {
                 if (n <= 0) break;
                 read += n;
             }
+            return data;
+        }
+    }
+
+    static void Save(byte[] data, string path) {
+        if (data.Length == 0) return;
+        try {
             if (File.Exists(path)) {
                 byte[] old = File.ReadAllBytes(path);
                 if (old.Length == data.Length) {
@@ -58,6 +86,15 @@ static class Program {
                 }
             }
             File.WriteAllBytes(path, data);
-        }
+        } catch { }
+    }
+
+    static void Log(System.Collections.Generic.IEnumerable<ErrorRecord> errors) {
+        try {
+            string log = Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PCDoctor"), "PCDoctor.log");
+            StringBuilder sb = new StringBuilder();
+            foreach (ErrorRecord e in errors) sb.AppendLine("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] Lanceur : " + e.ToString());
+            File.AppendAllText(log, sb.ToString(), Encoding.UTF8);
+        } catch { }
     }
 }

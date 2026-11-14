@@ -533,7 +533,7 @@ if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp
 # ---------------------------------------------------------------------------
 #  Réglages partagés (appli + boîte noire) : %LOCALAPPDATA%\PCDoctor\settings.ini
 # ---------------------------------------------------------------------------
-$script:AppVersion = '2.2.0'
+$script:AppVersion = '2.2.1'
 $script:Repo = 'doninj/pc-doctor'
 $script:SettingsFile = Join-Path $script:LogDir 'settings.ini'
 $script:BlackBoxDir = Join-Path $script:LogDir 'boite-noire'
@@ -596,6 +596,22 @@ function Format-Size([double]$Bytes) {
     return '{0:N0} o' -f $Bytes
 }
 
+# Lance un programme en arrière-plan, sans jamais ouvrir de fenêtre, et renvoie ses lignes de sortie.
+# (PowerShell tourne dans l'exe sans console : un appel classique ferait apparaître une fenêtre noire.)
+function Invoke-Hidden([string]$exe, [string]$arguments, [string]$encoding = 'oem') {
+    $psi = New-Object Diagnostics.ProcessStartInfo($exe, $arguments)
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = if ($encoding -eq 'utf8') { New-Object Text.UTF8Encoding $false } else { [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) }
+    $p = [Diagnostics.Process]::Start($psi)
+    $null = $p.StandardError.ReadToEndAsync()
+    $out = $p.StandardOutput.ReadToEnd()
+    $p.WaitForExit()
+    $p.Dispose()
+    @($out -split "`r?`n")
+}
+function Get-Sys32Exe([string]$name) { Join-Path ([Environment]::SystemDirectory) $name }
+
 function Get-PCSummary {
     $os  = Get-CimInstance Win32_OperatingSystem
     $cs  = Get-CimInstance Win32_ComputerSystem
@@ -653,7 +669,7 @@ function Get-PCSummary {
 
     $planGuid = ''; $planName = ''
     try {
-        $txt = (powercfg /getactivescheme) -join ' '
+        $txt = (Invoke-Hidden (Get-Sys32Exe 'powercfg.exe') '/getactivescheme') -join ' '
         if ($txt -match '([0-9a-fA-F]{8}-[0-9a-fA-F-]{27})') { $planGuid = $Matches[1].ToLower() }
         if ($txt -match '\(([^)]+)\)') { $planName = $Matches[1] }
     } catch {}
@@ -970,7 +986,7 @@ function Get-GpuLive {
     $smi = Get-NvidiaSmi
     if (-not $smi) { return $null }
     $line = $null
-    try { $line = (& $smi ($SmiQuery -split ' ') 2>$null) | Select-Object -First 1 } catch { return $null }
+    try { $line = Invoke-Hidden $smi $SmiQuery 'utf8' | Where-Object { $_ -match ',' } | Select-Object -First 1 } catch { return $null }
     ConvertFrom-SmiLine $line
 }
 
@@ -1146,7 +1162,7 @@ function Test-NetworkQuality {
     $ad = if ($route) { Get-NetAdapter -InterfaceIndex $route.ifIndex -ErrorAction SilentlyContinue } else { $null }
     $isWifi = $ad -and (([string]$ad.PhysicalMediaType -match '802\.11') -or ([string]$ad.InterfaceDescription -match 'Wi-?Fi|Wireless|WLAN|802\.11'))
     $signal = $null
-    if ($isWifi) { try { foreach ($l in (netsh wlan show interfaces)) { if ($l -match '^\s*Signal\s*:\s*(\d+)\s*%') { $signal = [int]$Matches[1] } } } catch {} }
+    if ($isWifi) { try { foreach ($l in (Invoke-Hidden (Get-Sys32Exe 'netsh.exe') 'wlan show interfaces')) { if ($l -match '^\s*Signal\s*:\s*(\d+)\s*%') { $signal = [int]$Matches[1] } } } catch {} }
     $dnsServers = @()
     if ($route) { try { $dnsServers = @((Get-DnsClientServerAddress -InterfaceIndex $route.ifIndex -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses) } catch {} }
 
@@ -1200,10 +1216,7 @@ function Get-WingetPath {
 function Get-WingetUpgrades {
     $wg = Get-WingetPath
     if (-not $wg) { throw "winget n'est pas installé sur ce PC (Microsoft Store > « Programme d'installation d'application »)." }
-    $prev = [Console]::OutputEncoding
-    try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
-    $lines = @(& $wg upgrade --include-unknown --source winget --accept-source-agreements --disable-interactivity 2>&1 | ForEach-Object { [string]$_ })
-    try { [Console]::OutputEncoding = $prev } catch {}
+    $lines = @(Invoke-Hidden $wg 'upgrade --include-unknown --source winget --accept-source-agreements --disable-interactivity' 'utf8')
     $rows = New-Object System.Collections.Generic.List[object]
     for ($i = 1; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -notmatch '^-{20,}\s*$') { continue }
@@ -3232,6 +3245,11 @@ try {
     # est vérifiée par le processus administrateur, puis il est exécuté depuis la mémoire :
     # un programme qui modifierait le fichier entre-temps ne peut pas obtenir les droits admin.
     function Start-ElevatedSelf {
+        # Depuis l'exe : on relance simplement l'exe en administrateur (il contient lui-même le script)
+        if ($ExePath -and (Test-Path -LiteralPath $ExePath)) {
+            Start-Process -FilePath $ExePath -Verb RunAs
+            return
+        }
         $path = $script:ScriptPath
         $bytes = [IO.File]::ReadAllBytes($path)
         $hash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)) -replace '-', ''
@@ -3363,14 +3381,14 @@ if (`$h -ne '$hash') { Add-Type -AssemblyName PresentationFramework; [void][Syst
     }
 
     function Get-PowerPlanName {
-        try { $t = (powercfg.exe /getactivescheme) -join ' '; if ($t -match '\(([^)]+)\)') { return $Matches[1] } } catch {}
+        try { $t = (Invoke-Hidden (Get-Sys32Exe 'powercfg.exe') '/getactivescheme') -join ' '; if ($t -match '\(([^)]+)\)') { return $Matches[1] } } catch {}
         return 'Inconnu'
     }
     function Set-PowerPlan([string]$which) {
         $guid = if ($which -eq 'high') { '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c' } else { '381b4222-f694-41f0-9685-ff5bb260df2e' }
-        try { $null = powercfg.exe /setactive $guid } catch {}
+        try { $null = Invoke-Hidden (Get-Sys32Exe 'powercfg.exe') "/setactive $guid" } catch {}
         $t = ''
-        try { $t = (powercfg.exe /getactivescheme) -join ' ' } catch {}
+        try { $t = (Invoke-Hidden (Get-Sys32Exe 'powercfg.exe') '/getactivescheme') -join ' ' } catch {}
         if ($t -match $guid) { Set-Status "Mode d'alimentation : $(Get-PowerPlanName)." }
         elseif ($which -eq 'high') { Set-Status "Le mode « Performances élevées » n'est pas disponible sur ce PC (Windows le masque parfois). Le mode Équilibré convient très bien." }
         else { Set-Status "Le mode d'alimentation n'a pas pu être changé." }
