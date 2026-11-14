@@ -14,6 +14,10 @@
   <a href="../../releases">Toutes les versions</a>
 </p>
 
+<p align="center">
+  <a href="../../actions/workflows/securite.yml"><img src="https://github.com/doninj/pc-doctor/actions/workflows/securite.yml/badge.svg" alt="Contrôles de sécurité"></a>
+</p>
+
 ---
 
 ## Ce que fait PC Doctor

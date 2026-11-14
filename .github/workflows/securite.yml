@@ -1,0 +1,58 @@
+# Contrôles de sécurité et de qualité, à chaque modification et chaque lundi.
+name: Sécurité
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+# Droits minimaux : lecture seule du code
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Aucun secret dans le code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # tout l'historique, pas seulement la dernière version
+      - name: Recherche de secrets (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  verification:
+    name: Script valide et exe compilable
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntaxe PowerShell
+        shell: powershell
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem -Recurse -Include *.ps1) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+            foreach ($e in $errs) { Write-Host "::error file=$($f.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"; $bad++ }
+          }
+          if ($bad) { exit 1 }
+          Write-Host "Aucune erreur de syntaxe."
+      - name: Aucun lancement caché de PowerShell ni contournement dans le lanceur
+        shell: powershell
+        run: |
+          $src = (Get-Content build\Launcher.cs | Where-Object { $_ -notmatch '^\s*//' }) -join "`n"   # hors commentaires
+          if ($src -match 'powershell\.exe|ExecutionPolicy|EncodedCommand') { Write-Host "::error::Le lanceur ne doit pas lancer powershell.exe"; exit 1 }
+          Write-Host "Lanceur conforme."
+      - name: Compilation de l'exe
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
+          if (-not (Test-Path 'PC Doctor.exe')) { exit 1 }
+          $v = (Get-Item 'PC Doctor.exe').VersionInfo.FileVersion
+          $h = (Get-FileHash 'PC Doctor.exe' -Algorithm SHA256).Hash
+          Write-Host "Exe compilé : version $v, SHA-256 $h"
