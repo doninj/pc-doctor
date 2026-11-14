@@ -1,12 +1,16 @@
-﻿#Requires -Version 5.1
-<#
+﻿<#
     PC Doctor - diagnostic du PC (lenteurs, plantages, espace disque)
-    Lancer via "Lancer PC Doctor.bat" (ou clic droit > Exécuter avec PowerShell).
+    Lancer via "PC Doctor.exe" ou "Lancer PC Doctor.bat".
+    Nécessite Windows PowerShell 5.1 (inclus dans Windows 10/11).
 #>
-param([switch]$SelfTest)
+param([switch]$SelfTest, [string]$LaunchedFrom)
 
 $ErrorActionPreference = 'Stop'
-$script:ScriptPath = $MyInvocation.MyCommand.Path
+# $LaunchedFrom est fourni quand le script est relancé en administrateur depuis la mémoire (voir Start-ElevatedSelf)
+$script:ScriptPath = if ($LaunchedFrom) { $LaunchedFrom } else { $MyInvocation.MyCommand.Path }
+# Chemins système résolus par l'API Windows (et non par des variables d'environnement modifiables)
+$script:Sys32 = [Environment]::SystemDirectory
+$script:PowerShellExe = Join-Path $script:Sys32 'WindowsPowerShell\v1.0\powershell.exe'
 $script:LogDir = Join-Path $env:LOCALAPPDATA 'PCDoctor'
 New-Item -ItemType Directory -Force -Path $script:LogDir | Out-Null
 $script:LogFile = Join-Path $script:LogDir 'PCDoctor.log'
@@ -213,13 +217,22 @@ namespace PCDoctor {
             CleanRec(di, ref freed, false);
             return freed;
         }
+        // Relit les attributs sur le disque juste avant d'agir : évite qu'un dossier remplacé
+        // entre-temps par un lien (jonction) fasse supprimer des fichiers ailleurs.
+        static bool IsLinkNow(string path) {
+            try { return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0; } catch { return true; }
+        }
         static void CleanRec(DirectoryInfo di, ref long freed, bool deleteSelf) {
+            if (deleteSelf && IsLinkNow(di.FullName)) {
+                try { Directory.Delete(di.FullName, false); } catch { LastFailed++; }
+                return;
+            }
             FileSystemInfo[] items;
             try { items = di.GetFileSystemInfos(); } catch { LastFailed++; return; }
             foreach (FileSystemInfo fsi in items) {
                 int attr = (int)fsi.Attributes;
                 if ((attr & (int)FileAttributes.Directory) != 0) {
-                    if ((attr & (int)FileAttributes.ReparsePoint) != 0) {
+                    if ((attr & (int)FileAttributes.ReparsePoint) != 0 || IsLinkNow(fsi.FullName)) {
                         // lien : on supprime uniquement le lien, jamais la cible
                         try { Directory.Delete(fsi.FullName, false); } catch { LastFailed++; }
                         continue;
@@ -228,8 +241,8 @@ namespace PCDoctor {
                 } else {
                     try {
                         long len = ((FileInfo)fsi).Length;
-                        if ((attr & (int)FileAttributes.ReadOnly) != 0) fsi.Attributes = FileAttributes.Normal;
-                        fsi.Delete();
+                        if ((attr & (int)FileAttributes.ReadOnly) != 0 && !IsLinkNow(fsi.FullName)) fsi.Attributes = FileAttributes.Normal;
+                        fsi.Delete();   // pour un lien, supprime le lien et pas sa cible
                         freed += len;
                     } catch { LastFailed++; }
                 }
@@ -626,10 +639,12 @@ function Get-CrashEvents([int]$Days = 30) {
 $SmiQuery = '--query-gpu=name,temperature.gpu,power.draw,power.limit,power.default_limit,power.min_limit,power.max_limit,clocks.gr,clocks.max.gr,fan.speed,utilization.gpu,driver_version --format=csv,noheader,nounits'
 
 function Get-NvidiaSmi {
-    $p = Join-Path $env:windir 'System32\nvidia-smi.exe'
-    if (Test-Path -LiteralPath $p) { return $p }
-    $c = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
-    if ($c) { return $c.Source }
+    # Uniquement les emplacements officiels du pilote NVIDIA (jamais le PATH, qui peut contenir des dossiers modifiables)
+    $candidates = @(
+        (Join-Path ([Environment]::SystemDirectory) 'nvidia-smi.exe'),
+        (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'NVIDIA Corporation\NVSMI\nvidia-smi.exe')
+    )
+    foreach ($p in $candidates) { if (Test-Path -LiteralPath $p -PathType Leaf) { return $p } }
     return $null
 }
 
@@ -2322,10 +2337,35 @@ try {
         [void]$script:Jobs.Add(@{ PS = $ps; RS = $rs; Handle = $h; OnDone = $OnDone })
     }
 
+    # --- Lancements en administrateur ------------------------------------------
+    # Règles : exécutables désignés par leur chemin complet dans System32, et code passé
+    # directement en mémoire (-EncodedCommand) plutôt que via un fichier modifiable.
+    function ConvertTo-EncodedCommand([string]$code) { [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code)) }
+    function Get-SysExe([string]$name) { Join-Path $script:Sys32 $name }
+
     function Start-AdminConsole([string]$cmd, [string]$title) {
         $full = "`$host.UI.RawUI.WindowTitle = '$title'; Write-Host 'PC Doctor - $title' -ForegroundColor Cyan; Write-Host 'Ne fermez pas cette fenetre avant la fin.' -ForegroundColor Yellow; $cmd; Write-Host ''; Write-Host 'Termine. Vous pouvez fermer cette fenetre.' -ForegroundColor Green"
-        try { Start-Process powershell.exe -Verb RunAs -ArgumentList @('-NoProfile', '-NoExit', '-Command', $full) }
+        try { Start-Process -FilePath $script:PowerShellExe -Verb RunAs -ArgumentList @('-NoProfile', '-NoExit', '-EncodedCommand', (ConvertTo-EncodedCommand $full)) }
         catch { Set-Status 'Action annulée (droits administrateur refusés).' }
+    }
+
+    # Relance PC Doctor en administrateur. Le script est lu une seule fois, son empreinte SHA-256
+    # est vérifiée par le processus administrateur, puis il est exécuté depuis la mémoire :
+    # un programme qui modifierait le fichier entre-temps ne peut pas obtenir les droits admin.
+    function Start-ElevatedSelf {
+        $path = $script:ScriptPath
+        $bytes = [IO.File]::ReadAllBytes($path)
+        $hash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)) -replace '-', ''
+        $p = $path -replace "'", "''"
+        $boot = @"
+`$p = '$p'
+`$b = [IO.File]::ReadAllBytes(`$p)
+`$h = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash(`$b)) -replace '-', ''
+if (`$h -ne '$hash') { Add-Type -AssemblyName PresentationFramework; [void][System.Windows.MessageBox]::Show('Le fichier de PC Doctor a été modifié entre-temps : lancement en administrateur annulé par sécurité.', 'PC Doctor'); exit 1 }
+`$s = [Text.Encoding]::UTF8.GetString(`$b).TrimStart([char]0xFEFF)
+& ([scriptblock]::Create(`$s)) -LaunchedFrom `$p
+"@
+        Start-Process -FilePath $script:PowerShellExe -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden', '-EncodedCommand', (ConvertTo-EncodedCommand $boot))
     }
 
     # --- Actions déclenchées par les boutons des constats / solutions -------
@@ -2339,18 +2379,21 @@ try {
         switch ($id) {
             'gpu-update' { Open-GpuUpdater }
             'gpu-site' { Start-Process (Get-GpuDriverUrl) }
-            'devmgmt' { Start-Process devmgmt.msc }
+            'devmgmt' { Start-Process (Get-SysExe 'devmgmt.msc') }
             'chipset' { Start-Process 'https://www.amd.com/fr/support/download/drivers.html' }
             'fastboot-off' { Set-FastStartup $false }
             'fastboot-on' { Set-FastStartup $true }
-            'mdsched' { Start-Process mdsched.exe }
-            'reliability' { Start-Process perfmon.exe -ArgumentList '/rel' }
-            'sfc' { Start-AdminConsole 'sfc /scannow; DISM /Online /Cleanup-Image /RestoreHealth' 'Reparation de Windows' }
-            'chkdsk' { Start-AdminConsole "chkdsk $env:SystemDrive /scan" 'Verification du disque' }
+            'mdsched' { Start-Process (Get-SysExe 'mdsched.exe') }
+            'reliability' { Start-Process (Get-SysExe 'perfmon.exe') -ArgumentList '/rel' }
+            'sfc' { Start-AdminConsole ("& '{0}' /scannow; & '{1}' /Online /Cleanup-Image /RestoreHealth" -f (Get-SysExe 'sfc.exe'), (Get-SysExe 'Dism.exe')) 'Reparation de Windows' }
+            'chkdsk' {
+                $drive = [IO.Path]::GetPathRoot($script:Sys32).TrimEnd('\')
+                Start-AdminConsole ("& '{0}' {1} /scan" -f (Get-SysExe 'chkdsk.exe'), $drive) 'Verification du disque'
+            }
             'bios' {
                 $r = [System.Windows.MessageBox]::Show("Le PC va redémarrer directement dans le BIOS dans 10 secondes.`n`nEnregistrez votre travail et fermez vos programmes avant de continuer.", 'Redémarrer dans le BIOS', 'OKCancel', 'Warning')
                 if ($r -eq 'OK') {
-                    try { Start-Process shutdown.exe -Verb RunAs -ArgumentList '/r /fw /t 10' -WindowStyle Hidden }
+                    try { Start-Process (Get-SysExe 'shutdown.exe') -Verb RunAs -ArgumentList '/r /fw /t 10' -WindowStyle Hidden }
                     catch { Set-Status 'Redémarrage annulé.' }
                 }
             }
@@ -2425,7 +2468,7 @@ try {
 
     function Set-FastStartup([bool]$on) {
         $v = if ($on) { 1 } else { 0 }
-        try { Start-Process reg.exe -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList "add `"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power`" /v HiberbootEnabled /t REG_DWORD /d $v /f" }
+        try { Start-Process (Get-SysExe 'reg.exe') -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList "add `"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power`" /v HiberbootEnabled /t REG_DWORD /d $v /f" }
         catch { Set-Status 'Action annulée (droits administrateur refusés).'; return }
         $now = Get-FastStartup
         if ($script:LastData) { $script:LastData.FastStartup = $now }
@@ -2525,10 +2568,10 @@ Write-Host ''
 Read-Host 'Appuyez sur Entree pour fermer'
 '@
         $idList = ($ids | ForEach-Object { "'" + ($_ -replace "[^0-9a-fA-F-]", '') + "'" }) -join ','
-        $path = Join-Path $script:LogDir 'installer-pilotes.ps1'
-        [IO.File]::WriteAllText($path, $tpl.Replace('__IDS__', $idList), (New-Object Text.UTF8Encoding $true))
+        # Passé en mémoire (pas de fichier sur le disque qu'un autre programme pourrait modifier)
+        $encoded = ConvertTo-EncodedCommand ($tpl.Replace('__IDS__', $idList))
         try {
-            Start-Process powershell.exe -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$path`"")
+            Start-Process -FilePath $script:PowerShellExe -Verb RunAs -ArgumentList @('-NoProfile', '-EncodedCommand', $encoded)
             $ui.TxtWuStatus.Text = 'Installation lancée dans la fenêtre administrateur (progression affichée dedans). Quand elle est terminée, cliquez sur « Rechercher » pour vérifier.'
         } catch { Set-Status 'Installation annulée (droits administrateur refusés).' }
     }
@@ -2831,7 +2874,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
             Reload-Startup
         })
     $ui.BtnRefreshStartup.Add_Click({ Reload-Startup; Set-Status 'Liste du démarrage actualisée.' })
-    $ui.BtnStartupTaskmgr.Add_Click({ Start-Process taskmgr.exe -ArgumentList '/0 /startup' })
+    $ui.BtnStartupTaskmgr.Add_Click({ Start-Process (Get-SysExe 'taskmgr.exe') -ArgumentList '/0 /startup' })
 
     # --- Espace disque ----------------------------------------------------
     $script:ScanTargets = New-Object System.Collections.ArrayList
@@ -2933,7 +2976,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
 
     $ui.BtnElevate.Add_Click({
             try {
-                Start-Process powershell.exe -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden', '-File', "`"$script:ScriptPath`"")
+                Start-ElevatedSelf
                 $window.Close()
             } catch { Set-Status 'Passage en administrateur annulé.' }
         })
@@ -2943,7 +2986,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
             Set-Status 'Mesure de l''activité des programmes…'
             Start-BgJob 'Get-ProcessUsage' { param($res) Show-Processes @($res); $ui.BtnRefreshProc.IsEnabled = $true; Set-Status ("Processus actualisés à {0:HH:mm:ss}." -f (Get-Date)) }
         })
-    $ui.BtnTaskmgr.Add_Click({ Start-Process taskmgr.exe })
+    $ui.BtnTaskmgr.Add_Click({ Start-Process (Get-SysExe 'taskmgr.exe') })
 
     $ui.BtnChooseFolder.Add_Click({
             $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -3000,7 +3043,13 @@ Read-Host 'Appuyez sur Entree pour fermer'
 
     # --- Nettoyage --------------------------------------------------------
     $ui.BtnCleanTemp.Add_Click({
-            $targets = @($env:TEMP, "$env:windir\Temp") | Where-Object { $_ -and $_.Length -gt 8 -and $_ -match '\\Temp$' -and (Test-Path -LiteralPath $_) }
+            # Uniquement les deux dossiers temporaires officiels, jamais un dossier racine ou le profil
+            $userTemp = [IO.Path]::GetTempPath().TrimEnd('\')
+            $winTemp = Join-Path ([Environment]::GetFolderPath('Windows')) 'Temp'
+            $userHome = [Environment]::GetFolderPath('UserProfile').TrimEnd('\')
+            $targets = @($userTemp, $winTemp) | Where-Object {
+                $_ -and $_ -match '\\Temp$' -and $_.Length -gt 8 -and $_ -ne $userHome -and ([IO.Path]::GetPathRoot($_).TrimEnd('\') -ne $_) -and (Test-Path -LiteralPath $_ -PathType Container)
+            } | Select-Object -Unique
             if (-not $targets) { Set-Status 'Dossier temporaire introuvable.'; return }
             $r = [System.Windows.MessageBox]::Show("Supprimer le contenu des dossiers temporaires ?`n`n" + (($targets | ForEach-Object { "• $_" }) -join "`n") + "`n`nCe sont des fichiers jetables. Ceux en cours d'utilisation sont simplement ignorés.", 'Fichiers temporaires', 'YesNo', 'Question')
             if ($r -ne 'Yes') { return }
@@ -3026,7 +3075,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
             Set-Status "Corbeille vidée : $(Format-Size $size) libérés."
             Refresh-Clean
         })
-    $ui.BtnCleanmgr.Add_Click({ Start-Process cleanmgr.exe })
+    $ui.BtnCleanmgr.Add_Click({ Start-Process (Get-SysExe 'cleanmgr.exe') })
     $ui.BtnStorageSettings.Add_Click({ Start-Process 'ms-settings:storagesense' })
     $ui.BtnRefreshClean.Add_Click({ Refresh-Clean })
 
