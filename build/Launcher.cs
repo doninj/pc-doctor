@@ -18,8 +18,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Diagnostic du PC : lenteurs, plantages, pilotes, espace disque")]
 [assembly: AssemblyCompany("PC Doctor (open source)")]
 [assembly: AssemblyCopyright("Licence MIT")]
-[assembly: AssemblyVersion("2.3.0.0")]
-[assembly: AssemblyFileVersion("2.3.0.0")]
+[assembly: AssemblyVersion("2.3.1.0")]
+[assembly: AssemblyFileVersion("2.3.1.0")]
 
 static class Program {
     [STAThread]

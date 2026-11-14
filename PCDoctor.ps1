@@ -49,6 +49,30 @@ namespace PCDoctor {
         public string CpuTempSource = "", DiskTempSource = "", DiskName = "", GpuName = "";
     }
 
+    // Garde les proportions d'une fenêtre pendant qu'on la redimensionne par ses bords (message WM_SIZING)
+    public class AspectLock : NativeWindow {
+        public double Ratio = 1.0;     // largeur / hauteur
+        public int MinWidth = 150, MaxWidth = 900;
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+        public AspectLock(IntPtr hwnd) { AssignHandle(hwnd); }
+        protected override void WndProc(ref Message m) {
+            if (m.Msg == 0x0214 && Ratio > 0.05) {
+                RECT r = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+                int edge = m.WParam.ToInt32();
+                int w = r.R - r.L, h = r.B - r.T;
+                if (edge == 3 || edge == 6) w = (int)Math.Round(h * Ratio);   // bord haut ou bas : la hauteur commande
+                w = Math.Max(MinWidth, Math.Min(MaxWidth, w));
+                h = (int)Math.Round(w / Ratio);
+                if (edge == 1 || edge == 4 || edge == 7) r.L = r.R - w; else r.R = r.L + w;
+                if (edge == 3 || edge == 4 || edge == 5) r.T = r.B - h; else r.B = r.T + h;
+                Marshal.StructureToPtr(r, m.LParam, false);
+                m.Result = (IntPtr)1;
+                return;
+            }
+            base.WndProc(ref m);
+        }
+    }
+
     public static class LiveSensors {
         [DllImport("kernel32.dll")] static extern bool GetSystemTimes(out long idle, out long kernel, out long user);
         [StructLayout(LayoutKind.Sequential)]
@@ -772,7 +796,7 @@ if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp
 # ---------------------------------------------------------------------------
 #  Réglages partagés (appli + boîte noire) : %LOCALAPPDATA%\PCDoctor\settings.ini
 # ---------------------------------------------------------------------------
-$script:AppVersion = '2.3.0'
+$script:AppVersion = '2.3.1'
 $script:Repo = 'doninj/pc-doctor'
 $script:SettingsFile = Join-Path $script:LogDir 'settings.ini'
 $script:BlackBoxDir = Join-Path $script:LogDir 'boite-noire'
@@ -828,9 +852,12 @@ if ($Monitor) {
 $widgetXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="PC Doctor - Widget" SizeToContent="WidthAndHeight" WindowStyle="None" AllowsTransparency="True"
-        Background="Transparent" ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True"
+        Title="PC Doctor - Widget" Width="230" Height="180" WindowStyle="None" AllowsTransparency="True"
+        Background="#01000000" ResizeMode="CanResize" ShowInTaskbar="False" Topmost="True"
         FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="12" UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
+  <WindowChrome.WindowChrome>
+    <WindowChrome CaptionHeight="0" ResizeBorderThickness="8" GlassFrameThickness="0" CornerRadius="0" UseAeroCaptionButtons="False"/>
+  </WindowChrome.WindowChrome>
   <Window.Resources>
     <FontFamily x:Key="Icons">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
     <Style TargetType="ProgressBar">
@@ -887,6 +914,7 @@ $widgetXaml = @'
     </Style>
   </Window.Resources>
 
+  <Viewbox x:Name="WBox" Stretch="Uniform">
   <Border x:Name="Root" Width="250" CornerRadius="14" BorderBrush="#30FFFFFF" BorderThickness="1" Padding="14,10,14,12" Margin="8">
     <Border.Background>
       <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
@@ -966,6 +994,7 @@ $widgetXaml = @'
       </Border>
     </StackPanel>
   </Border>
+  </Viewbox>
 </Window>
 '@
 
@@ -1078,15 +1107,31 @@ if ($Widget) {
         function Update-PinIcon { $wu.WPin.Foreground = Get-WBrush $(if ($ww.Topmost) { '#FF5B8CFF' } else { '#FF7D889B' }); $wu.WPin.ToolTip = if ($ww.Topmost) { 'Toujours au premier plan (cliquer pour désactiver)' } else { 'Cliquer pour garder le widget au premier plan' } }
         function Set-WidgetTopmost([bool]$on) { $ww.Topmost = $on; Set-Setting 'WidgetTopmost' $(if ($on) { '1' } else { '0' }); Update-PinIcon; $script:MiTop.IsChecked = $on }
         Update-PinIcon
+        # Taille naturelle du contenu (à l'échelle 1) : sert à garder les proportions
+        function Get-WidgetNatural {
+            $wu.Root.Measure((New-Object System.Windows.Size([double]::PositiveInfinity, [double]::PositiveInfinity)))
+            $d = $wu.Root.DesiredSize
+            @([math]::Max(1, $d.Width), [math]::Max(1, $d.Height))
+        }
+        function Update-WidgetRatio {
+            $n = Get-WidgetNatural
+            if ($script:WLock) { $script:WLock.Ratio = $n[0] / $n[1] }
+            $n
+        }
         function Set-WidgetScale([double]$s, [switch]$NoSave) {
-            $s = [math]::Max(0.6, [math]::Min(1.2, $s))
-            $wu.Root.LayoutTransform = New-Object System.Windows.Media.ScaleTransform($s, $s)
+            $s = [math]::Max(0.5, [math]::Min(2.5, $s))
+            $n = Update-WidgetRatio
+            $ww.Width = $n[0] * $s
+            $ww.Height = $n[1] * $s
+            $script:WScale = $s
             if (-not $NoSave) { Set-Setting 'WidgetScale' $s.ToString([Globalization.CultureInfo]::InvariantCulture) }
         }
         function Set-WidgetDetails([bool]$on, [switch]$NoSave) {
             Set-WidgetDetailsVisibility $wu $on
             $script:MiDetails.IsChecked = $on
             if (-not $NoSave) { Set-Setting 'WidgetDetails' $(if ($on) { '1' } else { '0' }) }
+            # même largeur, hauteur ajustée au nouveau contenu
+            if ($script:WScale) { Set-WidgetScale $script:WScale -NoSave }
         }
 
         # Déplacement à la souris
@@ -1137,15 +1182,42 @@ if ($Widget) {
 
         # Taille et détails (compact par défaut)
         $sc = 0.85; [void][double]::TryParse([string]$cfg['WidgetScale'], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$sc)
+        Set-WidgetDetailsVisibility $wu ($cfg['WidgetDetails'] -eq '1')
+        $script:MiDetails.IsChecked = ($cfg['WidgetDetails'] -eq '1')
         Set-WidgetScale $sc -NoSave
-        Set-WidgetDetails ($cfg['WidgetDetails'] -eq '1') -NoSave
+        if (-not $okPos) { $ww.Left = $wa.Right - $ww.Width - 16 }
+
+        # Redimensionnement par les bords : proportions verrouillées, contenu mis à l'échelle
+        $ww.Add_SourceInitialized({
+                try {
+                    $h = (New-Object System.Windows.Interop.WindowInteropHelper $ww).Handle
+                    $script:WLock = New-Object PCDoctor.AspectLock($h)
+                    [void](Update-WidgetRatio)
+                } catch { Write-Log "Widget (redimensionnement) : $_" }
+            })
+        $ww.Add_SizeChanged({
+                $n = Get-WidgetNatural
+                $script:WScale = $ww.ActualWidth / $n[0]
+                $script:WScaleDirty = $true
+            })
 
         [void][PCDoctor.LiveSensors]::Read()
         $wTimer = New-Object System.Windows.Threading.DispatcherTimer
         $wTimer.Interval = [TimeSpan]::FromSeconds(2)
-        $wTimer.Add_Tick({ try { Update-Widget $wu ([PCDoctor.LiveSensors]::Read()) } catch { Write-Log "Widget : $_" } })
+        $wTimer.Add_Tick({
+                try { Update-Widget $wu ([PCDoctor.LiveSensors]::Read()) } catch { Write-Log "Widget : $_" }
+                if ($script:WScaleDirty -and [System.Windows.Input.Mouse]::LeftButton -eq 'Released') {
+                    $script:WScaleDirty = $false
+                    Set-Setting 'WidgetScale' $script:WScale.ToString([Globalization.CultureInfo]::InvariantCulture)
+                    Save-WidgetPos
+                }
+            })
         $ww.Add_ContentRendered({ try { Update-Widget $wu ([PCDoctor.LiveSensors]::Read()) } catch {}; $wTimer.Start() })
-        $ww.Add_Closing({ $wTimer.Stop(); Save-WidgetPos })
+        $ww.Add_Closing({
+                $wTimer.Stop(); Save-WidgetPos
+                if ($script:WScale) { Set-Setting 'WidgetScale' $script:WScale.ToString([Globalization.CultureInfo]::InvariantCulture) }
+                if ($script:WLock) { try { $script:WLock.ReleaseHandle() } catch {} }
+            })
         [void]$ww.ShowDialog()
     } catch {
         Write-Log "Widget : $_ $($_.ScriptStackTrace)"
