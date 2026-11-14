@@ -3,7 +3,7 @@
     Lancer via "PC Doctor.exe" ou "Lancer PC Doctor.bat".
     Nécessite Windows PowerShell 5.1 (inclus dans Windows 10/11).
 #>
-param([switch]$SelfTest, [string]$LaunchedFrom)
+param([switch]$SelfTest, [string]$LaunchedFrom, [switch]$Monitor, [string]$ExePath)
 
 $ErrorActionPreference = 'Stop'
 # $LaunchedFrom est fourni quand le script est relancé en administrateur depuis la mémoire (voir Start-ElevatedSelf)
@@ -27,11 +27,263 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 $csharp = @'
 using System;
 using System.IO;
+using System.Text;
+using System.Globalization;
+using System.Diagnostics;
+using System.Drawing;
+using System.Windows.Forms;
 using System.Collections.Generic;
 using System.Threading;
 using System.Runtime.InteropServices;
 
 namespace PCDoctor {
+    // ---------------------------------------------------------------------
+    //  Boîte noire : enregistre l'état du PC toutes les 2 s (icône de notification)
+    // ---------------------------------------------------------------------
+    public static class BlackBox {
+        [StructLayout(LayoutKind.Sequential)] struct FILETIME { public uint Low; public uint High; }
+        [DllImport("kernel32.dll")] static extern bool GetSystemTimes(out FILETIME idle, out FILETIME kernel, out FILETIME user);
+        [StructLayout(LayoutKind.Sequential)]
+        class MEMORYSTATUSEX {
+            public uint dwLength; public uint dwMemoryLoad; public ulong ullTotalPhys; public ulong ullAvailPhys;
+            public ulong ullTotalPageFile; public ulong ullAvailPageFile; public ulong ullTotalVirtual; public ulong ullAvailVirtual; public ulong ullAvailExtendedVirtual;
+            public MEMORYSTATUSEX() { dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX)); }
+        }
+        [DllImport("kernel32.dll")] static extern bool GlobalMemoryStatusEx([In, Out] MEMORYSTATUSEX m);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr h);
+
+        public const string MutexName = @"Local\PCDoctorBlackBox";
+        public const string StopEventName = @"Local\PCDoctorBlackBoxStop";
+        public const string Header = "time;gpu_temp;gpu_power;gpu_limit;gpu_clock;gpu_usage;cpu;ram;app";
+
+        static ulong U(FILETIME f) { return ((ulong)f.High << 32) | f.Low; }
+        static ulong _pIdle, _pKernel, _pUser;
+        public static double CpuPercent() {
+            FILETIME i, k, u;
+            if (!GetSystemTimes(out i, out k, out u)) return -1;
+            ulong idle = U(i), kern = U(k), usr = U(u);
+            double r = -1;
+            if (_pKernel != 0) {
+                ulong di = idle - _pIdle, total = (kern - _pKernel) + (usr - _pUser);   // le temps noyau inclut le temps inactif
+                if (total > 0) r = Math.Max(0, Math.Min(100, 100.0 * (total - di) / total));
+            }
+            _pIdle = idle; _pKernel = kern; _pUser = usr;
+            return r;
+        }
+        public static int RamPercent() { MEMORYSTATUSEX m = new MEMORYSTATUSEX(); return GlobalMemoryStatusEx(m) ? (int)m.dwMemoryLoad : -1; }
+        public static string ForegroundApp() {
+            try {
+                uint pid; GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+                if (pid == 0) return "";
+                using (Process p = Process.GetProcessById((int)pid)) return p.ProcessName.Replace(";", "");
+            } catch { return ""; }
+        }
+
+        public static bool IsRunning() {
+            Mutex m;
+            if (Mutex.TryOpenExisting(MutexName, out m)) { m.Dispose(); return true; }
+            return false;
+        }
+        public static bool RequestStop() {
+            EventWaitHandle e;
+            if (EventWaitHandle.TryOpenExisting(StopEventName, out e)) { e.Set(); e.Dispose(); return true; }
+            return false;
+        }
+
+        static Process _smi; static volatile string _smiLine; static string _smiPath;
+        static void StartSmi() {
+            if (string.IsNullOrEmpty(_smiPath) || !File.Exists(_smiPath)) return;
+            try {
+                ProcessStartInfo psi = new ProcessStartInfo(_smiPath, "--query-gpu=temperature.gpu,power.draw,power.limit,clocks.gr,utilization.gpu --format=csv,noheader,nounits -lms 2000");
+                psi.UseShellExecute = false; psi.RedirectStandardOutput = true; psi.CreateNoWindow = true;
+                _smi = Process.Start(psi);
+                _smi.OutputDataReceived += delegate(object s, DataReceivedEventArgs e) { if (e.Data != null && e.Data.IndexOf(',') > 0) _smiLine = e.Data; };
+                _smi.BeginOutputReadLine();
+            } catch { _smi = null; }
+        }
+
+        // --- Lecture des enregistrements (utilisée par l'interface) ---
+        static IEnumerable<string> Lines(string dir, DateTime day) {
+            string file = Path.Combine(dir, day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ".csv");
+            if (!File.Exists(file)) yield break;
+            using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (StreamReader sr = new StreamReader(fs, Encoding.UTF8)) {
+                string l;
+                while ((l = sr.ReadLine()) != null) { if (l.Length >= 19 && l[0] != 't') yield return l; }
+            }
+        }
+        public static List<string> ReadRange(string dir, DateTime from, DateTime to) {
+            List<string> res = new List<string>();
+            string a = from.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture), b = to.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture);
+            for (DateTime d = from.Date; d <= to.Date; d = d.AddDays(1)) {
+                foreach (string l in Lines(dir, d)) {
+                    string ts = l.Substring(0, 19);
+                    if (string.CompareOrdinal(ts, a) >= 0 && string.CompareOrdinal(ts, b) <= 0) res.Add(l);
+                }
+            }
+            return res;
+        }
+        public static string LastBefore(string dir, DateTime t, int hoursBack) {
+            string limit = t.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture);
+            string start = t.AddHours(-hoursBack).ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture);
+            string last = null;
+            for (DateTime d = t.AddHours(-hoursBack).Date; d <= t.Date; d = d.AddDays(1)) {
+                foreach (string l in Lines(dir, d)) {
+                    string ts = l.Substring(0, 19);
+                    if (string.CompareOrdinal(ts, start) >= 0 && string.CompareOrdinal(ts, limit) < 0) last = l;
+                }
+            }
+            return last;
+        }
+
+        static NotifyIcon _tray; static System.Windows.Forms.Timer _timer; static bool _paused;
+        static string _dir, _settings, _openExe, _openArgs;
+        static int _alertTemp = 85; static bool _alerts = true;
+        static DateTime _lastAlertGpu = DateTime.MinValue, _lastAlertRam = DateTime.MinValue, _lastSettings = DateTime.MinValue;
+        static int _hotCount, _ramCount;
+        static EventWaitHandle _stop;
+
+        public static int Run(string dataDir, string settingsPath, string openExe, string openArgs, string iconPng, string smiPath) {
+            bool created;
+            using (Mutex mutex = new Mutex(true, MutexName, out created)) {
+                if (!created) return 1;   // déjà lancée
+                _dir = dataDir; _settings = settingsPath; _smiPath = smiPath; _openExe = openExe; _openArgs = openArgs;
+                Directory.CreateDirectory(_dir);
+                Cleanup();
+                LoadSettings();
+                _stop = new EventWaitHandle(false, EventResetMode.AutoReset, StopEventName);
+                StartSmi();
+                CpuPercent();
+
+                Application.EnableVisualStyles();
+                _tray = new NotifyIcon();
+                try {
+                    using (Bitmap b = new Bitmap(iconPng))
+                    using (Bitmap s = new Bitmap(b, new Size(32, 32))) {
+                        IntPtr h = s.GetHicon();
+                        _tray.Icon = (Icon)Icon.FromHandle(h).Clone();
+                        DestroyIcon(h);
+                    }
+                } catch { _tray.Icon = SystemIcons.Application; }
+                _tray.Text = "PC Doctor : boîte noire active";
+                ContextMenuStrip menu = new ContextMenuStrip();
+                menu.Items.Add("Ouvrir PC Doctor", null, delegate { OpenApp(); });
+                ToolStripMenuItem pause = new ToolStripMenuItem("Suspendre l'enregistrement");
+                pause.Click += delegate {
+                    _paused = !_paused;
+                    pause.Text = _paused ? "Reprendre l'enregistrement" : "Suspendre l'enregistrement";
+                    _tray.Text = _paused ? "PC Doctor : boîte noire en pause" : "PC Doctor : boîte noire active";
+                };
+                menu.Items.Add(pause);
+                menu.Items.Add(new ToolStripSeparator());
+                menu.Items.Add("Arrêter la surveillance", null, delegate { Application.Exit(); });
+                _tray.ContextMenuStrip = menu;
+                _tray.DoubleClick += delegate { OpenApp(); };
+                _tray.Visible = true;
+
+                _timer = new System.Windows.Forms.Timer();
+                _timer.Interval = 2000;
+                _timer.Tick += delegate { Tick(); };
+                _timer.Start();
+                Application.Run();
+
+                _timer.Stop();
+                _tray.Visible = false;
+                _tray.Dispose();
+                try { if (_smi != null && !_smi.HasExited) _smi.Kill(); } catch { }
+                return 0;
+            }
+        }
+
+        static void OpenApp() {
+            try {
+                ProcessStartInfo psi = new ProcessStartInfo(_openExe, _openArgs);
+                psi.UseShellExecute = false; psi.CreateNoWindow = true;
+                Process.Start(psi);
+            } catch { }
+        }
+
+        static string Num(string s) {
+            double d;
+            return double.TryParse(s.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out d) ? d.ToString("0.#", CultureInfo.InvariantCulture) : "";
+        }
+
+        static void Tick() {
+            if (_stop.WaitOne(0)) { Application.Exit(); return; }
+            if ((DateTime.Now - _lastSettings).TotalSeconds > 60) LoadSettings();
+            if (_smi != null && _smi.HasExited) { _smi = null; _smiLine = null; StartSmi(); }
+
+            double cpu = CpuPercent();
+            int ram = RamPercent();
+            string app = ForegroundApp();
+            string gt = "", gp = "", gl = "", gc = "", gu = "";
+            double gtemp = -1;
+            string line = _smiLine;
+            if (line != null) {
+                string[] v = line.Split(',');
+                if (v.Length >= 5) {
+                    gt = Num(v[0]); gp = Num(v[1]); gl = Num(v[2]); gc = Num(v[3]); gu = Num(v[4]);
+                    if (gt.Length > 0) gtemp = double.Parse(gt, CultureInfo.InvariantCulture);
+                }
+            }
+            if (!_paused) {
+                DateTime now = DateTime.Now;
+                string row = string.Format(CultureInfo.InvariantCulture, "{0:yyyy-MM-ddTHH:mm:ss};{1};{2};{3};{4};{5};{6};{7};{8}",
+                    now, gt, gp, gl, gc, gu, cpu < 0 ? "" : cpu.ToString("0", CultureInfo.InvariantCulture), ram < 0 ? "" : ram.ToString(CultureInfo.InvariantCulture), app);
+                Write(now, row);
+            }
+            Alerts(gtemp, ram);
+        }
+
+        static void Write(DateTime now, string row) {
+            string file = Path.Combine(_dir, now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ".csv");
+            try {
+                bool isNew = !File.Exists(file);
+                using (FileStream fs = new FileStream(file, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) {
+                    byte[] b = Encoding.UTF8.GetBytes((isNew ? Header + "\r\n" : "") + row + "\r\n");
+                    fs.Write(b, 0, b.Length);
+                    fs.Flush(true);   // écrit physiquement sur le disque : les données survivent à une coupure
+                }
+            } catch { }
+        }
+
+        static void Alerts(double gtemp, int ram) {
+            if (!_alerts) return;
+            _hotCount = gtemp >= _alertTemp ? _hotCount + 1 : 0;
+            if (_hotCount >= 2 && (DateTime.Now - _lastAlertGpu).TotalMinutes >= 10) {
+                _lastAlertGpu = DateTime.Now;
+                _tray.ShowBalloonTip(10000, "Carte graphique très chaude",
+                    string.Format(CultureInfo.InvariantCulture, "{0:0} °C (seuil d'alerte : {1} °C). Vérifiez la ventilation et la poussière.", gtemp, _alertTemp), ToolTipIcon.Warning);
+            }
+            _ramCount = ram >= 95 ? _ramCount + 1 : 0;
+            if (_ramCount >= 5 && (DateTime.Now - _lastAlertRam).TotalMinutes >= 15) {
+                _lastAlertRam = DateTime.Now;
+                _tray.ShowBalloonTip(10000, "Mémoire vive saturée", "La RAM est utilisée à " + ram + " % : le PC va ralentir. Fermez des programmes.", ToolTipIcon.Warning);
+            }
+        }
+
+        static void LoadSettings() {
+            _lastSettings = DateTime.Now;
+            try {
+                if (!File.Exists(_settings)) return;
+                foreach (string l in File.ReadAllLines(_settings)) {
+                    int i = l.IndexOf('=');
+                    if (i < 0) continue;
+                    string k = l.Substring(0, i).Trim(), v = l.Substring(i + 1).Trim();
+                    int n;
+                    if (k == "AlertGpuTemp" && int.TryParse(v, out n) && n >= 50 && n <= 110) _alertTemp = n;
+                    if (k == "Alerts") _alerts = v != "0";
+                }
+            } catch { }
+        }
+
+        static void Cleanup() {
+            try { foreach (string f in Directory.GetFiles(_dir, "*.csv")) if (File.GetLastWriteTime(f) < DateTime.Now.AddDays(-8)) File.Delete(f); } catch { }
+        }
+    }
+
     public class DirNode {
         public string Name; public string FullPath;
         public long Size; public long Files; public long Folders; public long OwnFilesSize;
@@ -276,7 +528,60 @@ namespace PCDoctor {
     }
 }
 '@
-if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp -Language CSharp }
+if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp -Language CSharp -ReferencedAssemblies System.Windows.Forms, System.Drawing }
+
+# ---------------------------------------------------------------------------
+#  Réglages partagés (appli + boîte noire) : %LOCALAPPDATA%\PCDoctor\settings.ini
+# ---------------------------------------------------------------------------
+$script:AppVersion = '2.2.0'
+$script:Repo = 'doninj/pc-doctor'
+$script:SettingsFile = Join-Path $script:LogDir 'settings.ini'
+$script:BlackBoxDir = Join-Path $script:LogDir 'boite-noire'
+$script:Defaults = @{ Theme = 'light'; Alerts = '1'; AlertGpuTemp = '85'; CheckUpdates = '1' }
+
+function Get-Settings {
+    $s = @{} + $script:Defaults
+    try {
+        if (Test-Path -LiteralPath $script:SettingsFile) {
+            foreach ($l in [IO.File]::ReadAllLines($script:SettingsFile)) {
+                $i = $l.IndexOf('='); if ($i -gt 0) { $s[$l.Substring(0, $i).Trim()] = $l.Substring($i + 1).Trim() }
+            }
+        }
+    } catch {}
+    $s
+}
+function Set-Setting([string]$key, [string]$value) {
+    $s = Get-Settings
+    $s[$key] = $value
+    $lines = $s.Keys | Sort-Object | ForEach-Object { "$_=$($s[$_])" }
+    [IO.File]::WriteAllLines($script:SettingsFile, [string[]]$lines)
+}
+
+# Comment relancer PC Doctor (depuis l'exe ou depuis le script)
+function Get-LaunchCommand([switch]$Monitor) {
+    if ($ExePath -and (Test-Path -LiteralPath $ExePath)) {
+        return @{ Exe = $ExePath; Args = $(if ($Monitor) { '--monitor' } else { '' }) }
+    }
+    $a = "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$script:ScriptPath`""
+    if ($Monitor) { $a += ' -Monitor' }
+    return @{ Exe = $script:PowerShellExe; Args = $a }
+}
+
+function Get-LogoPng {
+    $here = Split-Path -Parent $script:ScriptPath
+    foreach ($p in @((Join-Path $here 'PCDoctor.png'), (Join-Path $here 'build\PCDoctor.png'))) { if (Test-Path -LiteralPath $p) { return $p } }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+#  Mode surveillance (boîte noire) : pas d'interface, juste l'icône de notification
+# ---------------------------------------------------------------------------
+if ($Monitor) {
+    $smi = @((Join-Path $script:Sys32 'nvidia-smi.exe'), (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'NVIDIA Corporation\NVSMI\nvidia-smi.exe')) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    $open = Get-LaunchCommand
+    [void][PCDoctor.BlackBox]::Run($script:BlackBoxDir, $script:SettingsFile, $open.Exe, $open.Args, (Get-LogoPng), [string]$smi)
+    return
+}
 
 # ---------------------------------------------------------------------------
 #  Collecte des informations (exécutée en arrière-plan pour ne pas figer l'appli)
@@ -799,6 +1104,127 @@ function Get-DriverUpdates {
     }
 }
 
+# --- Santé détaillée des disques (SMART, nécessite le mode administrateur) ---
+function Get-DiskHealth {
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($d in @(Get-PhysicalDisk -ErrorAction SilentlyContinue)) {
+        $rc = $null
+        try { $rc = $d | Get-StorageReliabilityCounter -ErrorAction Stop } catch {}
+        $m = [string]$d.MediaType
+        $media = switch ($m) { '3' { 'HDD' } '4' { 'SSD' } 'HDD' { 'HDD' } 'SSD' { 'SSD' } default { 'Disque' } }
+        $b = [string]$d.BusType
+        $bus = switch ($b) { '17' { 'NVMe' } 'NVMe' { 'NVMe' } '11' { 'SATA' } 'SATA' { 'SATA' } '7' { 'USB' } 'USB' { 'USB' } '8' { 'RAID' } 'RAID' { 'RAID' } default { $b } }
+        if ($bus -eq 'NVMe') { $media = 'SSD' }
+        $h = [string]$d.HealthStatus
+        $health = switch ($h) { '0' { 'Bon' } 'Healthy' { 'Bon' } '1' { 'Avertissement' } 'Warning' { 'Avertissement' } '2' { 'Mauvais' } 'Unhealthy' { 'Mauvais' } default { 'Inconnu' } }
+        $temp = if ($rc -and $rc.Temperature -gt 0) { [int]$rc.Temperature } else { $null }
+        $tempMax = if ($rc -and $rc.TemperatureMax -gt 0) { [int]$rc.TemperatureMax } else { $null }
+        $wear = if ($rc -and $null -ne $rc.Wear -and $media -eq 'SSD') { [int]$rc.Wear } else { $null }
+        $hours = if ($rc -and $rc.PowerOnHours -gt 0) { [int64]$rc.PowerOnHours } else { $null }
+        $rerr = if ($rc -and $null -ne $rc.ReadErrorsUncorrected) { [int64]$rc.ReadErrorsUncorrected } else { $null }
+        $werr = if ($rc -and $null -ne $rc.WriteErrorsUncorrected) { [int64]$rc.WriteErrorsUncorrected } else { $null }
+        $hasDetails = ($null -ne $temp -or $null -ne $hours -or $null -ne $wear)
+        $hot = if ($bus -eq 'NVMe') { 70 } else { 55 }
+        [void]$out.Add([pscustomobject]@{
+            Name = ([string]$d.FriendlyName).Trim(); Media = $media; Bus = $bus; Size = [double]$d.Size
+            Kind = "$media $bus  ·  $(Format-Size ([double]$d.Size))"
+            Health = $health; Temp = $temp; TempMax = $tempMax; Wear = $wear; Hours = $hours; ReadErrors = $rerr; WriteErrors = $werr
+            HasDetails = $hasDetails; HotLimit = $hot
+            TempText = $(if ($null -ne $temp) { "$temp °C" + $(if ($tempMax) { "  (max $tempMax °C)" } else { '' }) } else { '—' })
+            WearText = $(if ($null -ne $wear) { "{0} % utilisée  ·  reste ~{1} %" -f $wear, [math]::Max(0, 100 - $wear) } elseif ($media -eq 'HDD') { 'Sans objet (disque mécanique)' } else { '—' })
+            HoursText = $(if ($null -ne $hours) { "{0:N0} h  (~{1:N1} ans allumé)" -f $hours, ($hours / 8766) } else { '—' })
+            ErrorsText = $(if ($null -ne $rerr -or $null -ne $werr) { $t = [int64]$rerr + [int64]$werr; if ($t -eq 0) { 'Aucune' } else { "$t erreur(s) non corrigée(s)" } } else { '—' })
+        })
+    }
+    $out
+}
+
+# --- Qualité de la connexion réseau ---
+function Test-NetworkQuality {
+    $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1
+    $gw = if ($route) { [string]$route.NextHop } else { $null }
+    $ad = if ($route) { Get-NetAdapter -InterfaceIndex $route.ifIndex -ErrorAction SilentlyContinue } else { $null }
+    $isWifi = $ad -and (([string]$ad.PhysicalMediaType -match '802\.11') -or ([string]$ad.InterfaceDescription -match 'Wi-?Fi|Wireless|WLAN|802\.11'))
+    $signal = $null
+    if ($isWifi) { try { foreach ($l in (netsh wlan show interfaces)) { if ($l -match '^\s*Signal\s*:\s*(\d+)\s*%') { $signal = [int]$Matches[1] } } } catch {} }
+    $dnsServers = @()
+    if ($route) { try { $dnsServers = @((Get-DnsClientServerAddress -InterfaceIndex $route.ifIndex -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses) } catch {} }
+
+    $targets = @()
+    if ($gw -and $gw -ne '0.0.0.0') { $targets += , @('Votre box / routeur', $gw, 'local') }
+    $targets += , @('Cloudflare (1.1.1.1)', '1.1.1.1', 'internet')
+    $targets += , @('Google (8.8.8.8)', '8.8.8.8', 'internet')
+    $pinger = New-Object System.Net.NetworkInformation.Ping
+    $results = foreach ($t in $targets) {
+        $rtts = New-Object System.Collections.Generic.List[double]
+        $lost = 0; $n = 20
+        for ($i = 0; $i -lt $n; $i++) {
+            try { $r = $pinger.Send($t[1], 1000); if ($r.Status -eq 'Success') { $rtts.Add([double]$r.RoundtripTime) } else { $lost++ } } catch { $lost++ }
+            Start-Sleep -Milliseconds 100
+        }
+        $avg = if ($rtts.Count) { ($rtts | Measure-Object -Average).Average } else { $null }
+        $jit = 0.0
+        if ($rtts.Count -gt 1) { $sum = 0.0; for ($k = 1; $k -lt $rtts.Count; $k++) { $sum += [math]::Abs($rtts[$k] - $rtts[$k - 1]) }; $jit = $sum / ($rtts.Count - 1) }
+        $loss = 100.0 * $lost / $n
+        [pscustomobject]@{
+            Name = $t[0]; Target = $t[1]; Scope = $t[2]; Avg = $avg; Jitter = $jit; Loss = $loss
+            Min = $(if ($rtts.Count) { ($rtts | Measure-Object -Minimum).Minimum } else { $null }); Max = $(if ($rtts.Count) { ($rtts | Measure-Object -Maximum).Maximum } else { $null })
+            AvgText = $(if ($null -ne $avg) { "{0:N0} ms" -f $avg } else { 'injoignable' })
+            RangeText = $(if ($rtts.Count) { "{0:N0} – {1:N0} ms" -f ($rtts | Measure-Object -Minimum).Minimum, ($rtts | Measure-Object -Maximum).Maximum } else { '—' })
+            JitterText = ("{0:N1} ms" -f $jit); LossText = ("{0:N0} %" -f $loss)
+            Verdict = $(if ($null -eq $avg) { 'Mauvais' } elseif ($loss -ge 5 -or ($t[2] -eq 'local' -and $avg -gt 10) -or $avg -gt 80 -or $jit -gt 15) { 'Mauvais' } elseif ($loss -gt 0 -or ($t[2] -eq 'local' -and $avg -gt 4) -or $avg -gt 40 -or $jit -gt 6) { 'Moyen' } else { 'Bon' })
+        }
+    }
+    $dnsMs = @()
+    foreach ($dom in 'wikipedia.org', 'steampowered.com', 'cloudflare.com') {
+        try { $sw = [Diagnostics.Stopwatch]::StartNew(); $null = Resolve-DnsName $dom -DnsOnly -NoHostsFile -QuickTimeout -Type A -ErrorAction Stop; $dnsMs += $sw.Elapsed.TotalMilliseconds } catch {}
+    }
+    [pscustomobject]@{
+        Adapter = $(if ($ad) { [string]$ad.InterfaceDescription } else { 'Inconnue' })
+        Type = $(if ($isWifi) { 'Wi-Fi' } elseif ($ad) { 'Câble Ethernet' } else { 'Inconnue' })
+        IsWifi = [bool]$isWifi; Signal = $signal; LinkSpeed = $(if ($ad) { [string]$ad.LinkSpeed } else { '' })
+        Gateway = $gw; DnsServers = $dnsServers
+        DnsMs = $(if ($dnsMs.Count) { ($dnsMs | Measure-Object -Average).Average } else { $null })
+        Results = @($results)
+    }
+}
+
+# --- Logiciels pouvant être mis à jour (winget) ---
+function Get-WingetPath {
+    $c = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($c) { return $c.Source }
+    $p = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+    if (Test-Path -LiteralPath $p) { return $p }
+    return $null
+}
+function Get-WingetUpgrades {
+    $wg = Get-WingetPath
+    if (-not $wg) { throw "winget n'est pas installé sur ce PC (Microsoft Store > « Programme d'installation d'application »)." }
+    $prev = [Console]::OutputEncoding
+    try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+    $lines = @(& $wg upgrade --include-unknown --source winget --accept-source-agreements --disable-interactivity 2>&1 | ForEach-Object { [string]$_ })
+    try { [Console]::OutputEncoding = $prev } catch {}
+    $rows = New-Object System.Collections.Generic.List[object]
+    for ($i = 1; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -notmatch '^-{20,}\s*$') { continue }
+        $header = ($lines[$i - 1] -split "`r")[-1]
+        $cols = @([regex]::Matches($header, '\S+') | ForEach-Object { $_.Index })
+        if ($cols.Count -lt 4) { continue }
+        for ($j = $i + 1; $j -lt $lines.Count; $j++) {
+            $l = $lines[$j]
+            if (-not $l.Trim() -or $l -match '^\d+\s' -or $l.Length -lt $cols[3]) { break }
+            $cut = { param($a, $b) if ($a -ge $l.Length) { '' } elseif ($null -eq $b -or $b -gt $l.Length) { $l.Substring($a).Trim() } else { $l.Substring($a, $b - $a).Trim() } }
+            $name = & $cut $cols[0] $cols[1]
+            $id = & $cut $cols[1] $cols[2]
+            $ver = & $cut $cols[2] $cols[3]
+            $avail = & $cut $cols[3] $(if ($cols.Count -gt 4) { $cols[4] } else { $null })
+            if (-not $id -or $id -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') { continue }
+            [void]$rows.Add([pscustomobject]@{ Name = $name; Id = $id; Version = $ver; Available = $avail })
+        }
+    }
+    $rows
+}
+
 function Get-CleanableItems {
     $L = $env:LOCALAPPDATA
     $downloads = Join-Path $env:USERPROFILE 'Downloads'
@@ -857,6 +1283,7 @@ function Invoke-Safe([scriptblock]$sb) { try { & $sb } catch { Write-Error ("Col
     ProblemDevices = @(Invoke-Safe { Get-ProblemDevices })
     FastStartup = Invoke-Safe { Get-FastStartup }
     Gpu       = Invoke-Safe { Get-GpuLive }
+    Disks     = @(Invoke-Safe { Get-DiskHealth })
 }
 '@
 
@@ -914,6 +1341,14 @@ function Get-Findings($d) {
     $probs = @($d.ProblemDevices | Where-Object { $_ -and $_.Serious })
     if ($probs.Count) { & $add 'Attention' "$($probs.Count) périphérique(s) en erreur" ((($probs | Select-Object -First 3 | ForEach-Object { "$($_.Name) : $($_.Problem)" }) -join '  ·  ') + '.') 'Voir les pilotes' 'goto:drivers' }
     if ($d.Gpu -and $d.Gpu.Temp -ge 83) { & $add 'Attention' ("Carte graphique chaude : {0:N0} °C" -f $d.Gpu.Temp) "Vérifiez la ventilation du boîtier et dépoussiérez la carte graphique." 'Températures' 'goto:perf' }
+    foreach ($dk in @($d.Disks | Where-Object { $_ })) {
+        if ($dk.ReadErrors -gt 0 -or $dk.WriteErrors -gt 0) { & $add 'Critique' "Disque « $($dk.Name) » : erreurs non corrigées" "Le disque n'arrive plus à lire ou écrire certaines données. Sauvegardez vos fichiers et prévoyez de le remplacer." 'Santé des disques' 'goto:perf' }
+        if ($null -ne $dk.Wear -and $dk.Wear -ge 80) { & $add 'Attention' "SSD « $($dk.Name) » usé à $($dk.Wear) %" "Il approche de sa fin de vie théorique : sauvegardez régulièrement et prévoyez son remplacement." 'Santé des disques' 'goto:perf' }
+        if ($null -ne $dk.Temp -and $dk.Temp -ge $dk.HotLimit) { & $add 'Attention' "Disque « $($dk.Name) » chaud ($($dk.Temp) °C)" "Améliorez la ventilation autour du disque (un dissipateur pour un SSD NVMe)." 'Santé des disques' 'goto:perf' }
+    }
+    $bbOn = $false
+    try { $bbOn = [PCDoctor.BlackBox]::IsRunning() } catch {}
+    if ($cs.Hard.Count -and -not $bbOn) { & $add 'Info' 'Activez la boîte noire pour comprendre les coupures' "Elle enregistre l'état du PC toutes les 2 secondes : après la prochaine coupure, vous verrez si c'était la chauffe, un pic de consommation ou autre chose." 'Activer la boîte noire' 'bb-start' }
 
     $s = $d.Summary
     if ($s) {
@@ -1003,6 +1438,23 @@ function Get-Solutions($d) {
     $isAmdCpu = $s -and $s.CpuName -match 'AMD|Ryzen'
     $silent = $cs.Silent.Count
     $bsod = $cs.Bsod.Count
+
+    # 0. Boîte noire
+    $bbOn = $false
+    try { $bbOn = [PCDoctor.BlackBox]::IsRunning() } catch {}
+    if ($cs.Hard.Count -or $bsod) {
+        if ($bbOn) {
+            & $addS $false 'Boîte noire : active' `
+                "PC Doctor enregistre l'état du PC toutes les 2 secondes. À la prochaine coupure, ouvrez la page Boîte noire pour voir ce qui se passait juste avant." `
+                "Rien à faire : laissez-la tourner (icône PC Doctor près de l'horloge)." `
+                @((& $act 'Ouvrir la boîte noire' 'goto:blackbox'))
+        } else {
+            & $addS $true 'Activer la boîte noire' `
+                "Pour trouver la cause, il faut savoir ce qui se passait au moment de la coupure. La boîte noire enregistre en continu la température et la consommation de la carte graphique, le processeur, la mémoire et le programme utilisé, et l'écrit sur le disque à chaque mesure : les données survivent à la coupure." `
+                "1. Cliquez sur « Activer la boîte noire » : elle démarre et se relancera avec Windows.`n2. Utilisez le PC normalement.`n3. Après la prochaine coupure, ouvrez PC Doctor > Boîte noire > « Analyser »." `
+                @((& $act 'Activer la boîte noire' 'bb-start'), (& $act 'En savoir plus' 'goto:blackbox'))
+        }
+    }
 
     # 1. RAM EXPO / XMP
     $bios = "Cherchez l'option EXPO, XMP ou DOCP et mettez-la sur « Désactivé » ou « Auto »."
@@ -1241,8 +1693,60 @@ $xamlText = @'
       </Setter>
     </Style>
 
+    <!-- Barres de défilement fines -->
+    <Style TargetType="ScrollBar">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Width" Value="10"/>
+      <Setter Property="MinWidth" Value="10"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ScrollBar">
+            <Track x:Name="PART_Track" IsDirectionReversed="True" Focusable="False">
+              <Track.Thumb>
+                <Thumb>
+                  <Thumb.Template>
+                    <ControlTemplate TargetType="Thumb"><Border Background="#FFC5CDD8" CornerRadius="4" Margin="2"/></ControlTemplate>
+                  </Thumb.Template>
+                </Thumb>
+              </Track.Thumb>
+            </Track>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+      <Style.Triggers>
+        <Trigger Property="Orientation" Value="Horizontal">
+          <Setter Property="Width" Value="Auto"/>
+          <Setter Property="MinWidth" Value="0"/>
+          <Setter Property="Height" Value="10"/>
+          <Setter Property="MinHeight" Value="10"/>
+          <Setter Property="Template">
+            <Setter.Value>
+              <ControlTemplate TargetType="ScrollBar">
+                <Track x:Name="PART_Track" IsDirectionReversed="False" Focusable="False">
+                  <Track.Thumb>
+                    <Thumb>
+                      <Thumb.Template>
+                        <ControlTemplate TargetType="Thumb"><Border Background="#FFC5CDD8" CornerRadius="4" Margin="2"/></ControlTemplate>
+                      </Thumb.Template>
+                    </Thumb>
+                  </Track.Thumb>
+                </Track>
+              </ControlTemplate>
+            </Setter.Value>
+          </Setter>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+    <Style TargetType="CheckBox">
+      <Setter Property="Foreground" Value="#FF0F172A"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="Margin" Value="0,4"/>
+      <Setter Property="Cursor" Value="Hand"/>
+    </Style>
+
     <!-- Tableaux -->
     <Style TargetType="DataGrid">
+      <Setter Property="Foreground" Value="#FF0F172A"/>
       <Setter Property="AutoGenerateColumns" Value="False"/>
       <Setter Property="IsReadOnly" Value="True"/>
       <Setter Property="HeadersVisibility" Value="Column"/>
@@ -1321,7 +1825,7 @@ $xamlText = @'
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="ListBoxItem">
-            <Border x:Name="Bd" Background="Transparent" CornerRadius="9" Padding="14,11">
+            <Border x:Name="Bd" Background="Transparent" CornerRadius="9" Padding="14,8">
               <Grid>
                 <Border x:Name="Bar" Width="3" HorizontalAlignment="Left" Margin="-14,3,0,3" CornerRadius="2" Background="#FF5B8CFF" Visibility="Collapsed"/>
                 <ContentPresenter/>
@@ -1418,12 +1922,27 @@ $xamlText = @'
           </ListBoxItem>
           <ListBoxItem>
             <DockPanel>
+              <Ellipse x:Name="NavBbDot" Width="8" Height="8" Fill="#FF22C55E" DockPanel.Dock="Right" VerticalAlignment="Center" Visibility="Collapsed"/>
+              <TextBlock Style="{StaticResource NavIcon}" Text="&#xE81C;"/><TextBlock Style="{StaticResource NavText}" Text="Boîte noire"/>
+            </DockPanel>
+          </ListBoxItem>
+          <ListBoxItem>
+            <DockPanel>
               <Border x:Name="BadgeDrivers" Style="{StaticResource Badge}" Background="#FFF59E0B" DockPanel.Dock="Right"><TextBlock x:Name="BadgeDriversText" Style="{StaticResource BadgeText}"/></Border>
               <TextBlock Style="{StaticResource NavIcon}" Text="&#xE772;"/><TextBlock Style="{StaticResource NavText}" Text="Pilotes"/>
             </DockPanel>
           </ListBoxItem>
           <ListBoxItem>
+            <DockPanel>
+              <Border x:Name="BadgeSoftware" Style="{StaticResource Badge}" Background="#FF3B6EF5" DockPanel.Dock="Right"><TextBlock x:Name="BadgeSoftwareText" Style="{StaticResource BadgeText}"/></Border>
+              <TextBlock Style="{StaticResource NavIcon}" Text="&#xE7B8;"/><TextBlock Style="{StaticResource NavText}" Text="Logiciels"/>
+            </DockPanel>
+          </ListBoxItem>
+          <ListBoxItem>
             <DockPanel><TextBlock Style="{StaticResource NavIcon}" Text="&#xEC4A;"/><TextBlock Style="{StaticResource NavText}" Text="Performances"/></DockPanel>
+          </ListBoxItem>
+          <ListBoxItem>
+            <DockPanel><TextBlock Style="{StaticResource NavIcon}" Text="&#xE839;"/><TextBlock Style="{StaticResource NavText}" Text="Réseau"/></DockPanel>
           </ListBoxItem>
           <ListBoxItem>
             <DockPanel>
@@ -1445,6 +1964,12 @@ $xamlText = @'
           </ListBoxItem>
           <ListBoxItem>
             <DockPanel><TextBlock Style="{StaticResource NavIcon}" Text="&#xEA99;"/><TextBlock Style="{StaticResource NavText}" Text="Nettoyage"/></DockPanel>
+          </ListBoxItem>
+          <ListBoxItem>
+            <DockPanel>
+              <Border x:Name="BadgeSettings" Style="{StaticResource Badge}" Background="#FF22C55E" DockPanel.Dock="Right"><TextBlock x:Name="BadgeSettingsText" Style="{StaticResource BadgeText}" Text="1"/></Border>
+              <TextBlock Style="{StaticResource NavIcon}" Text="&#xE713;"/><TextBlock Style="{StaticResource NavText}" Text="Paramètres"/>
+            </DockPanel>
           </ListBoxItem>
         </ListBox>
       </DockPanel>
@@ -1477,6 +2002,17 @@ $xamlText = @'
                   <TextBlock x:Name="TxtSysInfo" Style="{StaticResource PageSub}" Text="Analyse en cours…"/>
                 </StackPanel>
               </DockPanel>
+
+              <Border x:Name="UpdateBanner" Visibility="Collapsed" Background="#FF0F1A33" CornerRadius="12" Padding="18,14" Margin="0,0,0,18">
+                <DockPanel>
+                  <Button x:Name="BtnUpdateNow" DockPanel.Dock="Right" Content="Mettre à jour" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                  <TextBlock Text="&#xE896;" FontFamily="{StaticResource Icons}" FontSize="20" Foreground="#FF7EA2FF" DockPanel.Dock="Left" Margin="0,0,14,0" VerticalAlignment="Center"/>
+                  <StackPanel VerticalAlignment="Center">
+                    <TextBlock x:Name="TxtUpdateTitle" Foreground="White" FontWeight="SemiBold" FontSize="15"/>
+                    <TextBlock x:Name="TxtUpdateSub" Foreground="#FFC7D2E8" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                  </StackPanel>
+                </DockPanel>
+              </Border>
 
               <Grid Margin="0,0,0,24">
                 <Grid.ColumnDefinitions>
@@ -1637,6 +2173,131 @@ $xamlText = @'
           </ScrollViewer>
         </TabItem>
 
+        <!-- BOITE NOIRE -->
+        <TabItem>
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="BlackBoxRoot" Margin="32,28,32,24">
+              <TextBlock Style="{StaticResource PageTitle}" Text="Boîte noire"/>
+              <TextBlock Style="{StaticResource PageSub}" Text="PC Doctor enregistre discrètement l'état du PC toutes les 2 secondes : carte graphique (température, consommation), processeur, mémoire et programme utilisé. Après une coupure, vous voyez ce qui se passait juste avant."/>
+              <Grid Margin="0,18,0,20">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="16"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Border Style="{StaticResource Card}">
+                  <StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                      <Ellipse x:Name="BbDot" Width="12" Height="12" Fill="#FF94A3B8" VerticalAlignment="Center"/>
+                      <TextBlock x:Name="TxtBbStatus" Text="…" FontSize="18" FontWeight="SemiBold" Margin="10,0,0,0"/>
+                    </StackPanel>
+                    <TextBlock x:Name="TxtBbSub" Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,6,0,12"/>
+                    <WrapPanel>
+                      <Button x:Name="BtnBbStart" Margin="0,0,8,6">
+                        <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE768;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Démarrer la surveillance"/></StackPanel>
+                      </Button>
+                      <Button x:Name="BtnBbStop" Content="Arrêter" Style="{StaticResource Secondary}" Margin="0,0,8,6"/>
+                    </WrapPanel>
+                    <CheckBox x:Name="ChkBbAutostart" Content="Lancer automatiquement avec Windows (recommandé)" Margin="0,8,0,0"/>
+                    <TextBlock Style="{StaticResource MutedText}" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0" Text="Une icône PC Doctor apparaît près de l'horloge : clic droit pour la mettre en pause ou l'arrêter. Consommation : quasi nulle."/>
+                  </StackPanel>
+                </Border>
+                <Border Grid.Column="2" Style="{StaticResource Card}">
+                  <StackPanel>
+                    <TextBlock Text="Alertes" FontSize="18" FontWeight="SemiBold"/>
+                    <TextBlock Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,6,0,10" Text="Une notification Windows s'affiche quand quelque chose ne va pas (fonctionne quand la surveillance est active)."/>
+                    <CheckBox x:Name="ChkAlerts" Content="Me prévenir quand la carte graphique chauffe trop"/>
+                    <StackPanel Orientation="Horizontal" Margin="24,6,0,0">
+                      <TextBlock Text="Seuil d'alerte :" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                      <ComboBox x:Name="CmbAlertTemp" Width="90" Padding="8,4">
+                        <ComboBoxItem Content="75 °C"/>
+                        <ComboBoxItem Content="80 °C"/>
+                        <ComboBoxItem Content="85 °C"/>
+                        <ComboBoxItem Content="90 °C"/>
+                      </ComboBox>
+                    </StackPanel>
+                    <TextBlock Style="{StaticResource MutedText}" FontSize="12" TextWrapping="Wrap" Margin="0,12,0,0" Text="Une alerte est aussi affichée si la mémoire vive reste saturée (95 % ou plus)."/>
+                  </StackPanel>
+                </Border>
+              </Grid>
+
+              <DockPanel Margin="0,0,0,10">
+                <Button x:Name="BtnBbLast" DockPanel.Dock="Right" Content="Voir les 10 dernières minutes" Style="{StaticResource Secondary}" Margin="0"/>
+                <TextBlock Style="{StaticResource Section}" Text="Plantages des 7 derniers jours" Margin="0" VerticalAlignment="Center"/>
+              </DockPanel>
+              <Border Style="{StaticResource Panel}">
+                <DataGrid x:Name="GridBbCrashes" MaxHeight="240">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="REDÉMARRAGE" Binding="{Binding DateText}" SortMemberPath="Date" Width="150"/>
+                    <DataGridTextColumn Header="TYPE" Binding="{Binding Category}" Width="150"/>
+                    <DataGridTextColumn Header="DONNÉES DE LA BOÎTE NOIRE" Binding="{Binding LastText}" Width="*"/>
+                    <DataGridTemplateColumn Header="" Width="120">
+                      <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                          <Button x:Name="B" Content="Analyser" Tag="bb-analyze" Style="{StaticResource Small}" Width="96"/>
+                          <DataTemplate.Triggers>
+                            <DataTrigger Binding="{Binding HasData}" Value="False"><Setter TargetName="B" Property="IsEnabled" Value="False"/></DataTrigger>
+                          </DataTemplate.Triggers>
+                        </DataTemplate>
+                      </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                  </DataGrid.Columns>
+                </DataGrid>
+              </Border>
+              <TextBlock x:Name="TxtBbCrashInfo" Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,8,0,0"/>
+
+              <Border x:Name="BbAnalysis" Style="{StaticResource Card}" Margin="0,18,0,0" Visibility="Collapsed">
+                <StackPanel>
+                  <TextBlock x:Name="TxtBbTitle" FontSize="17" FontWeight="SemiBold"/>
+                  <Border Background="#FFF7F9FC" CornerRadius="10" Padding="14,12" Margin="0,10,0,0">
+                    <TextBlock x:Name="TxtBbVerdict" TextWrapping="Wrap" LineHeight="21"/>
+                  </Border>
+                  <UniformGrid Columns="2" Margin="0,14,-12,0">
+                    <Border Background="#FFF7F9FC" CornerRadius="10" Padding="12,10" Margin="0,0,12,12">
+                      <StackPanel>
+                        <DockPanel><TextBlock x:Name="ChartGpuTempInfo" DockPanel.Dock="Right" Style="{StaticResource MutedText}" FontSize="12"/><TextBlock Text="Température carte graphique" FontWeight="SemiBold" FontSize="12.5"/></DockPanel>
+                        <Canvas x:Name="ChartGpuTemp" Height="90" Margin="0,8,0,0" ClipToBounds="True"/>
+                      </StackPanel>
+                    </Border>
+                    <Border Background="#FFF7F9FC" CornerRadius="10" Padding="12,10" Margin="0,0,12,12">
+                      <StackPanel>
+                        <DockPanel><TextBlock x:Name="ChartGpuPowerInfo" DockPanel.Dock="Right" Style="{StaticResource MutedText}" FontSize="12"/><TextBlock Text="Consommation carte graphique" FontWeight="SemiBold" FontSize="12.5"/></DockPanel>
+                        <Canvas x:Name="ChartGpuPower" Height="90" Margin="0,8,0,0" ClipToBounds="True"/>
+                      </StackPanel>
+                    </Border>
+                    <Border Background="#FFF7F9FC" CornerRadius="10" Padding="12,10" Margin="0,0,12,12">
+                      <StackPanel>
+                        <DockPanel><TextBlock x:Name="ChartCpuInfo" DockPanel.Dock="Right" Style="{StaticResource MutedText}" FontSize="12"/><TextBlock Text="Processeur" FontWeight="SemiBold" FontSize="12.5"/></DockPanel>
+                        <Canvas x:Name="ChartCpu" Height="90" Margin="0,8,0,0" ClipToBounds="True"/>
+                      </StackPanel>
+                    </Border>
+                    <Border Background="#FFF7F9FC" CornerRadius="10" Padding="12,10" Margin="0,0,12,12">
+                      <StackPanel>
+                        <DockPanel><TextBlock x:Name="ChartRamInfo" DockPanel.Dock="Right" Style="{StaticResource MutedText}" FontSize="12"/><TextBlock Text="Mémoire vive" FontWeight="SemiBold" FontSize="12.5"/></DockPanel>
+                        <Canvas x:Name="ChartRam" Height="90" Margin="0,8,0,0" ClipToBounds="True"/>
+                      </StackPanel>
+                    </Border>
+                  </UniformGrid>
+                  <TextBlock x:Name="TxtBbTableTitle" Text="Dernières mesures" FontWeight="SemiBold" Margin="0,4,0,8"/>
+                  <Border Style="{StaticResource Panel}">
+                    <DataGrid x:Name="GridBbSamples" MaxHeight="300">
+                      <DataGrid.Columns>
+                        <DataGridTextColumn Header="HEURE" Binding="{Binding TimeText}" Width="90"/>
+                        <DataGridTextColumn Header="GPU °C" Binding="{Binding GpuTempText}" Width="80"/>
+                        <DataGridTextColumn Header="GPU W" Binding="{Binding GpuPowerText}" Width="90"/>
+                        <DataGridTextColumn Header="GPU %" Binding="{Binding GpuUsageText}" Width="75"/>
+                        <DataGridTextColumn Header="PROCESSEUR" Binding="{Binding CpuText}" Width="100"/>
+                        <DataGridTextColumn Header="RAM" Binding="{Binding RamText}" Width="75"/>
+                        <DataGridTextColumn Header="PROGRAMME AU PREMIER PLAN" Binding="{Binding App}" Width="*"/>
+                      </DataGrid.Columns>
+                    </DataGrid>
+                  </Border>
+                </StackPanel>
+              </Border>
+            </StackPanel>
+          </ScrollViewer>
+        </TabItem>
+
         <!-- PILOTES -->
         <TabItem>
           <ScrollViewer VerticalScrollBarVisibility="Auto">
@@ -1746,6 +2407,40 @@ $xamlText = @'
               </Border>
             </StackPanel>
           </ScrollViewer>
+        </TabItem>
+
+        <!-- LOGICIELS -->
+        <TabItem>
+          <DockPanel Margin="32,28,32,20">
+            <StackPanel DockPanel.Dock="Top">
+              <TextBlock Style="{StaticResource PageTitle}" Text="Mises à jour des logiciels"/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Mettez à jour vos programmes (navigateurs, launchers, outils…) en un clic, grâce à winget, l'outil officiel de Microsoft. Les installations se font dans une fenêtre qui montre la progression."/>
+              <DockPanel Margin="0,16,0,8">
+                <Button x:Name="BtnSwSearch" Content="Rechercher" Style="{StaticResource Secondary}" DockPanel.Dock="Left"/>
+                <Button x:Name="BtnSwAll" DockPanel.Dock="Left" IsEnabled="False">
+                  <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE896;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Tout mettre à jour"/></StackPanel>
+                </Button>
+                <TextBlock x:Name="TxtSwStatus" Style="{StaticResource MutedText}" VerticalAlignment="Center" TextWrapping="Wrap" Text="La recherche démarre à l'ouverture de cette page."/>
+              </DockPanel>
+              <ProgressBar x:Name="SwBar" Style="{x:Null}" Height="3" Margin="0,0,0,10" Foreground="#FF3B6EF5" Background="Transparent" BorderThickness="0" Visibility="Collapsed"/>
+            </StackPanel>
+            <Border Style="{StaticResource Panel}">
+              <DataGrid x:Name="GridSoftware">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="LOGICIEL" Binding="{Binding Name}" Width="*">
+                    <DataGridTextColumn.ElementStyle><Style TargetType="TextBlock"><Setter Property="FontWeight" Value="SemiBold"/></Style></DataGridTextColumn.ElementStyle>
+                  </DataGridTextColumn>
+                  <DataGridTextColumn Header="VERSION INSTALLÉE" Binding="{Binding Version}" Width="160"/>
+                  <DataGridTextColumn Header="NOUVELLE VERSION" Binding="{Binding Available}" Width="160"/>
+                  <DataGridTemplateColumn Header="" Width="140">
+                    <DataGridTemplateColumn.CellTemplate>
+                      <DataTemplate><Button Content="Mettre à jour" Tag="sw-update" Style="{StaticResource Small}" Width="112"/></DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                  </DataGridTemplateColumn>
+                </DataGrid.Columns>
+              </DataGrid>
+            </Border>
+          </DockPanel>
         </TabItem>
 
         <!-- PERFORMANCES / OVERCLOCKING -->
@@ -1865,6 +2560,111 @@ $xamlText = @'
                   </StackPanel>
                 </Border>
               </Grid>
+
+              <TextBlock Style="{StaticResource Section}" Text="Santé des disques" Margin="0,24,0,6"/>
+              <TextBlock x:Name="TxtDiskHealthNote" Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,0,0,10" Visibility="Collapsed" Text="Passez en administrateur (en bas à gauche) pour voir la température, l'usure et les erreurs de chaque disque."/>
+              <ItemsControl x:Name="ListDisks">
+                <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <Border Style="{StaticResource Card}" Width="340" Margin="0,0,14,14">
+                      <StackPanel>
+                        <DockPanel>
+                          <Border x:Name="P" DockPanel.Dock="Right" CornerRadius="10" Padding="9,2" Background="#FFE3F7EA" VerticalAlignment="Top">
+                            <TextBlock x:Name="T" Text="{Binding Health, Mode=OneWay}" FontSize="11.5" FontWeight="SemiBold" Foreground="#FF15803D"/>
+                          </Border>
+                          <StackPanel>
+                            <TextBlock Text="{Binding Name, Mode=OneWay}" FontWeight="SemiBold" FontSize="14.5" TextTrimming="CharacterEllipsis"/>
+                            <TextBlock Text="{Binding Kind, Mode=OneWay}" Style="{StaticResource MutedText}" FontSize="12"/>
+                          </StackPanel>
+                        </DockPanel>
+                        <DockPanel Margin="0,12,0,3"><TextBlock Text="Température" Width="100" Style="{StaticResource MutedText}"/><TextBlock Text="{Binding TempText, Mode=OneWay}"/></DockPanel>
+                        <DockPanel Margin="0,3"><TextBlock Text="Usure" Width="100" Style="{StaticResource MutedText}"/><TextBlock Text="{Binding WearText, Mode=OneWay}"/></DockPanel>
+                        <DockPanel Margin="0,3"><TextBlock Text="Allumé" Width="100" Style="{StaticResource MutedText}"/><TextBlock Text="{Binding HoursText, Mode=OneWay}"/></DockPanel>
+                        <DockPanel Margin="0,3"><TextBlock Text="Erreurs" Width="100" Style="{StaticResource MutedText}"/><TextBlock Text="{Binding ErrorsText, Mode=OneWay}"/></DockPanel>
+                      </StackPanel>
+                    </Border>
+                    <DataTemplate.Triggers>
+                      <DataTrigger Binding="{Binding Health}" Value="Avertissement"><Setter TargetName="P" Property="Background" Value="#FFFFF1DB"/><Setter TargetName="T" Property="Foreground" Value="#FFB45309"/></DataTrigger>
+                      <DataTrigger Binding="{Binding Health}" Value="Mauvais"><Setter TargetName="P" Property="Background" Value="#FFFEECEC"/><Setter TargetName="T" Property="Foreground" Value="#FFDC2626"/></DataTrigger>
+                      <DataTrigger Binding="{Binding Health}" Value="Inconnu"><Setter TargetName="P" Property="Background" Value="#FFF1F5F9"/><Setter TargetName="T" Property="Foreground" Value="#FF64748B"/></DataTrigger>
+                    </DataTemplate.Triggers>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </StackPanel>
+          </ScrollViewer>
+        </TabItem>
+
+        <!-- RESEAU -->
+        <TabItem>
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="NetRoot" Margin="32,28,32,24">
+              <TextBlock Style="{StaticResource PageTitle}" Text="Réseau"/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Testez la qualité de votre connexion : latence (ping), stabilité (gigue) et pertes de paquets. Utile quand les jeux en ligne lagguent."/>
+              <DockPanel Margin="0,16,0,8">
+                <Button x:Name="BtnNetTest" DockPanel.Dock="Left">
+                  <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE768;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Lancer le test"/></StackPanel>
+                </Button>
+                <TextBlock x:Name="TxtNetStatus" Style="{StaticResource MutedText}" VerticalAlignment="Center" TextWrapping="Wrap" Text="Le test dure une dizaine de secondes."/>
+              </DockPanel>
+              <ProgressBar x:Name="NetBar" Style="{x:Null}" Height="3" Margin="0,0,0,10" Foreground="#FF3B6EF5" Background="Transparent" BorderThickness="0" Visibility="Collapsed"/>
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="2*"/>
+                  <ColumnDefinition Width="16"/>
+                  <ColumnDefinition Width="3*"/>
+                </Grid.ColumnDefinitions>
+                <Border Style="{StaticResource Card}">
+                  <StackPanel>
+                    <TextBlock Text="CONNEXION" Style="{StaticResource MutedText}" FontSize="11.5" FontWeight="SemiBold"/>
+                    <TextBlock x:Name="TxtNetType" Text="—" FontSize="18" FontWeight="SemiBold" Margin="0,2,0,4"/>
+                    <TextBlock x:Name="TxtNetDetail" Style="{StaticResource MutedText}" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Border>
+                <Border Grid.Column="2" Style="{StaticResource Card}">
+                  <StackPanel>
+                    <TextBlock Text="VERDICT" Style="{StaticResource MutedText}" FontSize="11.5" FontWeight="SemiBold"/>
+                    <TextBlock x:Name="TxtNetVerdictTitle" Text="Lancez le test" FontSize="18" FontWeight="SemiBold" Margin="0,2,0,4"/>
+                    <TextBlock x:Name="TxtNetVerdict" TextWrapping="Wrap" Foreground="#FF475569"/>
+                  </StackPanel>
+                </Border>
+              </Grid>
+              <Border Style="{StaticResource Panel}" Margin="0,16,0,0">
+                <DataGrid x:Name="GridNet">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="CIBLE" Binding="{Binding Name}" Width="*">
+                      <DataGridTextColumn.ElementStyle><Style TargetType="TextBlock"><Setter Property="FontWeight" Value="SemiBold"/></Style></DataGridTextColumn.ElementStyle>
+                    </DataGridTextColumn>
+                    <DataGridTextColumn Header="PING MOYEN" Binding="{Binding AvgText}" Width="110"/>
+                    <DataGridTextColumn Header="MIN – MAX" Binding="{Binding RangeText}" Width="120"/>
+                    <DataGridTextColumn Header="GIGUE" Binding="{Binding JitterText}" Width="90"/>
+                    <DataGridTextColumn Header="PERTES" Binding="{Binding LossText}" Width="80"/>
+                    <DataGridTemplateColumn Header="RÉSULTAT" Width="110">
+                      <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                          <Border x:Name="P" CornerRadius="10" Padding="10,3" HorizontalAlignment="Left" Background="#FFE3F7EA">
+                            <TextBlock x:Name="T" Text="{Binding Verdict, Mode=OneWay}" FontSize="12" FontWeight="SemiBold" Foreground="#FF15803D"/>
+                          </Border>
+                          <DataTemplate.Triggers>
+                            <DataTrigger Binding="{Binding Verdict}" Value="Moyen"><Setter TargetName="P" Property="Background" Value="#FFFFF1DB"/><Setter TargetName="T" Property="Foreground" Value="#FFB45309"/></DataTrigger>
+                            <DataTrigger Binding="{Binding Verdict}" Value="Mauvais"><Setter TargetName="P" Property="Background" Value="#FFFEECEC"/><Setter TargetName="T" Property="Foreground" Value="#FFDC2626"/></DataTrigger>
+                          </DataTemplate.Triggers>
+                        </DataTemplate>
+                      </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                  </DataGrid.Columns>
+                </DataGrid>
+              </Border>
+              <Border Style="{StaticResource Card}" Margin="0,16,0,0">
+                <DockPanel>
+                  <Button DockPanel.Dock="Right" Content="Paramètres réseau" Tag="ms-settings:network-status" Style="{StaticResource Secondary}" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                  <StackPanel>
+                    <TextBlock Text="DNS (traduction des adresses web)" FontWeight="SemiBold"/>
+                    <TextBlock x:Name="TxtNetDns" Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,4,0,0" Text="—"/>
+                  </StackPanel>
+                </DockPanel>
+              </Border>
             </StackPanel>
           </ScrollViewer>
         </TabItem>
@@ -2184,6 +2984,51 @@ $xamlText = @'
             </Border>
           </DockPanel>
         </TabItem>
+        <!-- PARAMETRES -->
+        <TabItem>
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="SettingsRoot" Margin="32,28,32,24" MaxWidth="900" HorizontalAlignment="Left">
+              <TextBlock Style="{StaticResource PageTitle}" Text="Paramètres"/>
+              <Border Style="{StaticResource Card}" Margin="0,18,0,14">
+                <StackPanel>
+                  <TextBlock Text="Apparence" FontSize="16" FontWeight="SemiBold"/>
+                  <TextBlock x:Name="TxtThemeInfo" Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,4,0,12"/>
+                  <WrapPanel>
+                    <Button x:Name="BtnThemeLight" Style="{StaticResource Secondary}" Margin="0,0,8,6">
+                      <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE706;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Thème clair"/></StackPanel>
+                    </Button>
+                    <Button x:Name="BtnThemeDark" Style="{StaticResource Secondary}" Margin="0,0,8,6">
+                      <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE708;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Thème sombre"/></StackPanel>
+                    </Button>
+                  </WrapPanel>
+                </StackPanel>
+              </Border>
+              <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+                <StackPanel>
+                  <TextBlock Text="Mises à jour de PC Doctor" FontSize="16" FontWeight="SemiBold"/>
+                  <TextBlock x:Name="TxtAppVersion" Style="{StaticResource MutedText}" Margin="0,4,0,4"/>
+                  <TextBlock x:Name="TxtUpdateStatus" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                  <CheckBox x:Name="ChkCheckUpdates" Content="Vérifier les mises à jour à chaque démarrage"/>
+                  <WrapPanel Margin="0,10,0,0">
+                    <Button x:Name="BtnCheckUpdate" Content="Vérifier maintenant" Style="{StaticResource Secondary}" Margin="0,0,8,6"/>
+                    <Button x:Name="BtnInstallUpdate" Content="Installer la mise à jour" Margin="0,0,8,6" Visibility="Collapsed"/>
+                    <Button Content="Page GitHub du projet" Tag="url:https://github.com/doninj/pc-doctor" Style="{StaticResource Secondary}" Margin="0,0,8,6"/>
+                  </WrapPanel>
+                  <TextBlock Style="{StaticResource MutedText}" FontSize="12" TextWrapping="Wrap" Margin="0,6,0,0" Text="La vérification interroge uniquement github.com. Chaque mise à jour est contrôlée par son empreinte SHA-256 avant d'être installée."/>
+                </StackPanel>
+              </Border>
+              <Border Style="{StaticResource Card}">
+                <DockPanel>
+                  <Button x:Name="BtnOpenData" DockPanel.Dock="Right" Content="Ouvrir le dossier" Style="{StaticResource Secondary}" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                  <StackPanel>
+                    <TextBlock Text="Données de PC Doctor" FontSize="16" FontWeight="SemiBold"/>
+                    <TextBlock x:Name="TxtDataInfo" Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                  </StackPanel>
+                </DockPanel>
+              </Border>
+            </StackPanel>
+          </ScrollViewer>
+        </TabItem>
       </TabControl>
 
       <Border Grid.Row="1" Background="White" BorderBrush="#FFE6EAF0" BorderThickness="0,1,0,0" Padding="32,8">
@@ -2197,8 +3042,31 @@ $xamlText = @'
 </Window>
 '@
 
+# --- Thème sombre : palette claire -> palette sombre (appliquée au chargement de l'interface)
+$script:DarkMap = [ordered]@{
+    '#FFF4F6FA' = '#FF0E131D'; '#FF0F172A' = '#FFE6EAF2'; '#FF64748B' = '#FF97A3B6'; '#FF94A3B8' = '#FF7F8BA0'
+    '#FF475569' = '#FFB3BDCC'; '#FF374151' = '#FFB3BDCC'
+    '#FFE6EAF0' = '#FF262F41'; '#FFE2E8F0' = '#FF262F41'; '#FFD5DCE6' = '#FF323C50'
+    '#FFF7F9FC' = '#FF1B2232'; '#FFF1F4F8' = '#FF1E2534'; '#FFEDF1F7' = '#FF2A3346'; '#FFE6EBF2' = '#FF1B2232'; '#FFF1F5F9' = '#FF2A3346'
+    '#FFE8EFFE' = '#FF1D2A4A'; '#FFEFF4FF' = '#FF1D2A4A'; '#FFDBEAFE' = '#FF1D2A4A'
+    '#FFFEECEC' = '#FF3A1E24'; '#FFFEF2F2' = '#FF2E1A1F'; '#FFFBCACA' = '#FF5B2A31'
+    '#FFFFF4E0' = '#FF3A2E17'; '#FFFFF1DB' = '#FF3A2E17'; '#FFFFFBEB' = '#FF2E2614'
+    '#FFE7F8EE' = '#FF16301F'; '#FFE3F7EA' = '#FF16301F'; '#FFF0FDF4' = '#FF14271B'
+    '#FFC5CDD8' = '#FF3A4458'; '#FF15803D' = '#FF4ADE80'; '#FFB45309' = '#FFFBBF24'
+}
+$script:DarkCard = '#FF161C29'
+$script:IsDark = ((Get-Settings)['Theme'] -eq 'dark')
+
+function Convert-XamlTheme([string]$text) {
+    if (-not $script:IsDark) { return $text }
+    $text = [regex]::Replace($text, '(?<=Background=")White(?=")', $script:DarkCard)
+    $text = [regex]::Replace($text, '(?<=Property="(Background|RowBackground)" Value=")White(?=")', $script:DarkCard)
+    foreach ($k in $script:DarkMap.Keys) { $text = $text.Replace($k, $script:DarkMap[$k]) }
+    $text
+}
+
 function New-PCDoctorWindow {
-    [xml]$x = $xamlText
+    [xml]$x = Convert-XamlTheme $xamlText
     $reader = New-Object System.Xml.XmlNodeReader $x
     $w = [Windows.Markup.XamlReader]::Load($reader)
     $map = @{}
@@ -2279,9 +3147,17 @@ if ($SelfTest) {
     $appr = Get-Item -LiteralPath $testKey
     "Lecture : désactivé=$(Test-Disabled $appr 'FakeApp')"
     Remove-Item -LiteralPath 'HKCU:\Software\PCDoctorSelfTest' -Recurse -Force
+    "--- Disques ---"
+    $d.Disks | ForEach-Object { "  $($_.Name) | $($_.Kind) | $($_.Health) | détails=$($_.HasDetails)" }
+    "--- Boîte noire ---"
+    $bbLines = [PCDoctor.BlackBox]::ReadRange($script:BlackBoxDir, (Get-Date).AddDays(-1), (Get-Date))
+    "Lignes enregistrées (24 h) : $($bbLines.Count) ; active : $([PCDoctor.BlackBox]::IsRunning())"
     "--- Interface ---"
     $built = New-PCDoctorWindow
     "Fenêtre OK, $($built.UI.Count) éléments nommés"
+    $script:IsDark = $true
+    $builtDark = New-PCDoctorWindow
+    "Fenêtre thème sombre OK, $($builtDark.UI.Count) éléments nommés"
     return
 }
 
@@ -2291,17 +3167,15 @@ if ($SelfTest) {
 try {
     $built = New-PCDoctorWindow
     $window = $built.Window
-    $here = Split-Path -Parent $script:ScriptPath
-    foreach ($logo in @((Join-Path $here 'PCDoctor.png'), (Join-Path $here 'build\PCDoctor.png'))) {
-        if (Test-Path -LiteralPath $logo) {
-            try { $window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create((New-Object Uri $logo)) } catch {}
-            break
-        }
-    }
+    $logo = Get-LogoPng
+    if ($logo) { try { $window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create((New-Object Uri $logo)) } catch {} }
     $script:ui = $built.UI
     $ui = $script:ui
     $script:Brush = New-Object System.Windows.Media.BrushConverter
-    function Get-Brush([string]$hex) { $script:Brush.ConvertFromString($hex) }
+    function Get-Brush([string]$hex) {
+        if ($script:IsDark -and $script:DarkMap.Contains($hex)) { $hex = $script:DarkMap[$hex] }
+        $script:Brush.ConvertFromString($hex)
+    }
 
     $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if ($script:IsAdmin) {
@@ -2313,14 +3187,19 @@ try {
 
     function Set-Status([string]$t) { $script:ui.TxtStatus.Text = $t }
 
-    $script:Pages = @{ diag = 0; solutions = 1; drivers = 2; perf = 3; startup = 4; procs = 5; crashes = 6; disk = 7; clean = 8 }
+    $script:Pages = @{ diag = 0; solutions = 1; blackbox = 2; drivers = 3; software = 4; perf = 5; network = 6; startup = 7; procs = 8; crashes = 9; disk = 10; clean = 11; settings = 12 }
     function Show-Page([string]$name) { if ($script:Pages.ContainsKey($name)) { $ui.NavList.SelectedIndex = $script:Pages[$name] } }
     $script:DriversLoaded = $false
+    $script:SoftwareLoaded = $false
     $ui.NavList.Add_SelectionChanged({
             $i = $ui.NavList.SelectedIndex
             if ($i -lt 0) { return }
             $ui.Tabs.SelectedIndex = $i
-            if ($i -eq $script:Pages['drivers'] -and -not $script:DriversLoaded) { Load-Drivers }
+            try {
+                if ($i -eq $script:Pages['drivers'] -and -not $script:DriversLoaded) { Load-Drivers }
+                if ($i -eq $script:Pages['software'] -and -not $script:SoftwareLoaded) { Start-SoftwareSearch }
+                if ($i -eq $script:Pages['blackbox']) { Update-BlackBoxStatus; Show-BlackBoxCrashes }
+            } catch { Write-Log "Navigation : $_ $($_.ScriptStackTrace)" }
         })
     $ui.NavList.SelectedIndex = 0
 
@@ -2363,7 +3242,7 @@ try {
 `$h = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash(`$b)) -replace '-', ''
 if (`$h -ne '$hash') { Add-Type -AssemblyName PresentationFramework; [void][System.Windows.MessageBox]::Show('Le fichier de PC Doctor a été modifié entre-temps : lancement en administrateur annulé par sécurité.', 'PC Doctor'); exit 1 }
 `$s = [Text.Encoding]::UTF8.GetString(`$b).TrimStart([char]0xFEFF)
-& ([scriptblock]::Create(`$s)) -LaunchedFrom `$p
+& ([scriptblock]::Create(`$s)) -LaunchedFrom `$p -ExePath '$([string]$ExePath -replace "'", "''")'
 "@
         Start-Process -FilePath $script:PowerShellExe -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden', '-EncodedCommand', (ConvertTo-EncodedCommand $boot))
     }
@@ -2383,6 +3262,12 @@ if (`$h -ne '$hash') { Add-Type -AssemblyName PresentationFramework; [void][Syst
             'chipset' { Start-Process 'https://www.amd.com/fr/support/download/drivers.html' }
             'fastboot-off' { Set-FastStartup $false }
             'fastboot-on' { Set-FastStartup $true }
+            'bb-start' {
+                Start-BlackBox
+                Set-BlackBoxAutostart $true
+                Set-Status 'Boîte noire activée : elle enregistre maintenant en continu et se relancera avec Windows.'
+                $script:BbRefreshAt = [DateTime]::Now.AddSeconds(3)
+            }
             'mdsched' { Start-Process (Get-SysExe 'mdsched.exe') }
             'reliability' { Start-Process (Get-SysExe 'perfmon.exe') -ArgumentList '/rel' }
             'sfc' { Start-AdminConsole ("& '{0}' /scannow; & '{1}' /Online /Cleanup-Image /RestoreHealth" -f (Get-SysExe 'sfc.exe'), (Get-SysExe 'Dism.exe')) 'Reparation de Windows' }
@@ -2707,6 +3592,9 @@ Read-Host 'Appuyez sur Entree pour fermer'
             $ui.TxtOcToolsAdvice.Text = "Ni MSI Afterburner, ni Ryzen Master, ni Intel XTU n'ont été trouvés : pas d'overclocking logiciel sur ce PC. Un éventuel overclocking ne peut venir que du BIOS (EXPO/XMP, PBO)."
         }
         $ui.TxtPowerPlan.Text = if ($d.Summary.PowerPlanName) { $d.Summary.PowerPlanName } else { Get-PowerPlanName }
+        $disks = @($d.Disks | Where-Object { $_ })
+        $ui.ListDisks.ItemsSource = $disks
+        $ui.TxtDiskHealthNote.Visibility = if ($disks.Count -and -not @($disks | Where-Object { $_.HasDetails }).Count -and -not $script:IsAdmin) { 'Visible' } else { 'Collapsed' }
     }
     $ui.BtnGoSolutions.Add_Click({ Show-Page 'solutions' })
 
@@ -2969,6 +3857,10 @@ Read-Host 'Appuyez sur Entree pour fermer'
             }
             try { Update-ScanProgress } catch { Write-Log "Scan : $_" }
             try { Step-GpuPoll } catch { Write-Log "GPU : $_" }
+            if ($script:BbRefreshAt -and [DateTime]::Now -ge $script:BbRefreshAt) {
+                $script:BbRefreshAt = $null
+                try { Update-BlackBoxStatus; Refresh-Solutions } catch { Write-Log "Boîte noire : $_" }
+            }
         })
 
     # --- Boutons ----------------------------------------------------------
@@ -3079,7 +3971,397 @@ Read-Host 'Appuyez sur Entree pour fermer'
     $ui.BtnStorageSettings.Add_Click({ Start-Process 'ms-settings:storagesense' })
     $ui.BtnRefreshClean.Add_Click({ Refresh-Clean })
 
-    $window.Add_Loaded({ Start-FullAnalysis })
+    # =====================================================================
+    #  BOÎTE NOIRE
+    # =====================================================================
+    $script:RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $script:RunName = 'PCDoctorBoiteNoire'
+    $script:Loading = $true
+
+    function Test-BlackBoxAutostart {
+        try { return [bool](Get-ItemProperty -LiteralPath $script:RunKey -Name $script:RunName -ErrorAction Stop).$($script:RunName) } catch { return $false }
+    }
+    function Set-BlackBoxAutostart([bool]$on) {
+        if ($on) {
+            $c = Get-LaunchCommand -Monitor
+            New-ItemProperty -LiteralPath $script:RunKey -Name $script:RunName -Value ("`"{0}`" {1}" -f $c.Exe, $c.Args).Trim() -PropertyType String -Force | Out-Null
+        } else { Remove-ItemProperty -LiteralPath $script:RunKey -Name $script:RunName -ErrorAction SilentlyContinue }
+    }
+    function Start-BlackBox {
+        if ([PCDoctor.BlackBox]::IsRunning()) { return }
+        $c = Get-LaunchCommand -Monitor
+        $psi = New-Object Diagnostics.ProcessStartInfo($c.Exe, $c.Args)
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        [void][Diagnostics.Process]::Start($psi)
+    }
+
+    function Update-BlackBoxStatus {
+        $on = [PCDoctor.BlackBox]::IsRunning()
+        $ui.BbDot.Fill = Get-Brush $(if ($on) { '#FF22C55E' } else { '#FF94A3B8' })
+        $ui.NavBbDot.Visibility = if ($on) { 'Visible' } else { 'Collapsed' }
+        $ui.TxtBbStatus.Text = if ($on) { 'Surveillance active' } else { 'Surveillance arrêtée' }
+        $ui.BtnBbStart.IsEnabled = -not $on
+        $ui.BtnBbStop.IsEnabled = $on
+        $files = @(Get-ChildItem -LiteralPath $script:BlackBoxDir -Filter *.csv -ErrorAction SilentlyContinue)
+        $size = [double]($files | Measure-Object Length -Sum).Sum
+        $ui.TxtBbSub.Text = if ($files.Count) { "{0} jour(s) enregistré(s), {1} sur le disque (conservés 7 jours)." -f $files.Count, (Format-Size $size) } else { "Aucune donnée enregistrée pour l'instant." }
+        $script:Loading = $true
+        $ui.ChkBbAutostart.IsChecked = Test-BlackBoxAutostart
+        $script:Loading = $false
+    }
+
+    function ConvertFrom-BbLine([string]$l) {
+        $v = $l.Split(';')
+        if ($v.Count -lt 9) { return $null }
+        $inv = [Globalization.CultureInfo]::InvariantCulture
+        $n = { param($s) $x = 0.0; if ($s -and [double]::TryParse($s, [Globalization.NumberStyles]::Float, $inv, [ref]$x)) { $x } else { $null } }
+        $t = [datetime]::ParseExact($v[0], 'yyyy-MM-ddTHH:mm:ss', $inv)
+        $gt = & $n $v[1]; $gp = & $n $v[2]; $gl = & $n $v[3]; $gu = & $n $v[5]; $cpu = & $n $v[6]; $ram = & $n $v[7]
+        [pscustomobject]@{
+            Time = $t; GpuTemp = $gt; GpuPower = $gp; GpuLimit = $gl; GpuClock = (& $n $v[4]); GpuUsage = $gu; Cpu = $cpu; Ram = $ram; App = $v[8]
+            TimeText = $t.ToString('HH:mm:ss')
+            GpuTempText = $(if ($null -ne $gt) { "{0:N0} °C" -f $gt } else { '—' })
+            GpuPowerText = $(if ($null -ne $gp) { "{0:N0} W" -f $gp } else { '—' })
+            GpuUsageText = $(if ($null -ne $gu) { "{0:N0} %" -f $gu } else { '—' })
+            CpuText = $(if ($null -ne $cpu) { "{0:N0} %" -f $cpu } else { '—' })
+            RamText = $(if ($null -ne $ram) { "{0:N0} %" -f $ram } else { '—' })
+        }
+    }
+
+    function Show-BlackBoxCrashes {
+        $since = (Get-Date).AddDays(-7)
+        $events = @()
+        if ($script:LastData) { $events = @($script:LastData.Crashes | Where-Object { $_ -and $_.Date -ge $since -and @('Arrêt brutal', 'Écran bleu (BSOD)') -contains $_.Category }) }
+        $rows = foreach ($e in $events) {
+            $last = [PCDoctor.BlackBox]::LastBefore($script:BlackBoxDir, $e.Date, 12)
+            $s = if ($last) { ConvertFrom-BbLine $last } else { $null }
+            $gapMin = if ($s) { ($e.Date - $s.Time).TotalMinutes } else { $null }
+            [pscustomobject]@{
+                Date = $e.Date; DateText = $e.DateText; Category = $e.Category
+                HasData = [bool]$s; CutTime = $(if ($s) { $s.Time } else { $null })
+                LastText = $(if ($s) { "Dernier enregistrement à {0} ({1})" -f $s.Time.ToString('HH:mm:ss'), $(if ($gapMin -lt 60) { "{0:N0} min avant le redémarrage" -f $gapMin } else { "{0:N1} h avant le redémarrage" -f ($gapMin / 60) }) } else { 'Pas de données : la boîte noire ne tournait pas à ce moment-là' })
+            }
+        }
+        $rows = @($rows | Sort-Object Date -Descending)
+        $ui.GridBbCrashes.ItemsSource = $rows
+        $withData = @($rows | Where-Object { $_.HasData }).Count
+        $ui.TxtBbCrashInfo.Text = if (-not $rows.Count) { 'Aucun plantage ces 7 derniers jours.' }
+        elseif (-not $withData) { "Aucun de ces plantages n'a été enregistré : activez la surveillance pour que le prochain le soit." }
+        else { "$withData plantage(s) enregistré(s) par la boîte noire : cliquez sur « Analyser »." }
+    }
+
+    function Draw-Chart($canvas, $values, [double]$max, [string]$color, $warn) {
+        $canvas.Children.Clear()
+        $w = $canvas.ActualWidth
+        if ($w -lt 50) { $w = 420 }
+        $h = $canvas.Height
+        if ($null -ne $warn -and $warn -lt $max) {
+            $y = $h - ($warn / $max) * $h
+            $line = New-Object System.Windows.Shapes.Line
+            $line.X1 = 0; $line.X2 = $w; $line.Y1 = $y; $line.Y2 = $y
+            $line.Stroke = Get-Brush '#FFEF4444'; $line.StrokeThickness = 1; $line.Opacity = 0.5
+            $line.StrokeDashArray = New-Object System.Windows.Media.DoubleCollection (, [double[]](4, 3))
+            [void]$canvas.Children.Add($line)
+        }
+        $n = $values.Count
+        if ($n -lt 2) { return }
+        $poly = New-Object System.Windows.Shapes.Polyline
+        $poly.Stroke = Get-Brush $color; $poly.StrokeThickness = 2; $poly.StrokeLineJoin = 'Round'
+        for ($i = 0; $i -lt $n; $i++) {
+            $v = $values[$i]
+            if ($null -eq $v) { continue }
+            $poly.Points.Add((New-Object System.Windows.Point(($i / ($n - 1) * $w), ($h - [math]::Min($v, $max) / $max * ($h - 2) - 1))))
+        }
+        [void]$canvas.Children.Add($poly)
+    }
+
+    function Get-BbVerdict($samples, [bool]$isCrash) {
+        $end = $samples[-1].Time
+        $last = @($samples | Where-Object { $_.Time -ge $end.AddSeconds(-60) })
+        $mx = { param($p) $vals = @($last | ForEach-Object { $_.$p } | Where-Object { $null -ne $_ }); if ($vals.Count) { ($vals | Measure-Object -Maximum).Maximum } else { $null } }
+        $maxT = & $mx 'GpuTemp'; $maxP = & $mx 'GpuPower'; $maxU = & $mx 'GpuUsage'; $maxCpu = & $mx 'Cpu'; $maxRam = & $mx 'Ram'
+        $lim = ($last | Where-Object { $_.GpuLimit } | Select-Object -Last 1).GpuLimit
+        $app = ($last | Where-Object { $_.App } | Group-Object App | Sort-Object Count -Descending | Select-Object -First 1).Name
+        $lines = New-Object System.Collections.Generic.List[string]
+        $heavy = $false
+        if ($null -ne $maxT) {
+            if ($maxT -ge 85) { $lines.Add(("• Carte graphique très chaude ({0:N0} °C) : la surchauffe est une cause probable." -f $maxT)); $heavy = $true }
+            elseif ($maxT -ge 78) { $lines.Add(("• Carte graphique chaude ({0:N0} °C), mais pas à un niveau critique." -f $maxT)) }
+            else { $lines.Add(("• Température de la carte graphique normale ({0:N0} °C max) : pas de surchauffe côté carte graphique." -f $maxT)) }
+        }
+        if ($null -ne $maxP -and $lim) {
+            if ($maxP -ge 0.9 * $lim) { $lines.Add(("• La carte graphique tirait presque toute sa puissance ({0:N0} W sur {1:N0} W) : un pic de consommation est possible. Testez l'alimentation (limite à 75 %, page Solutions)." -f $maxP, $lim)); $heavy = $true }
+            else { $lines.Add(("• Consommation de la carte graphique : {0:N0} W au maximum (limite {1:N0} W)." -f $maxP, $lim)) }
+        }
+        if ($null -ne $maxCpu -and $maxCpu -ge 90) { $lines.Add(("• Processeur à fond ({0:N0} %)." -f $maxCpu)); $heavy = $true }
+        if ($null -ne $maxRam -and $maxRam -ge 95) { $lines.Add(("• Mémoire vive saturée ({0:N0} %)." -f $maxRam)); $heavy = $true }
+        if ($app) { $lines.Add("• Programme au premier plan : $app.") }
+        if ($isCrash -and -not $heavy) {
+            $lines.Add(("`nLe PC était peu sollicité au moment de la coupure (carte graphique {0:N0} %, processeur {1:N0} %). La surchauffe et un pic de consommation sont donc peu probables : regardez plutôt la RAM (test mémoire), le pilote graphique ou une alimentation défectueuse même au repos." -f [double]$maxU, [double]$maxCpu))
+        }
+        ($lines -join "`n")
+    }
+
+    function Show-BlackBoxWindow([datetime]$end, [int]$minutes, [bool]$isCrash) {
+        $raw = [PCDoctor.BlackBox]::ReadRange($script:BlackBoxDir, $end.AddMinutes(-$minutes), $end)
+        $samples = @($raw | ForEach-Object { ConvertFrom-BbLine $_ } | Where-Object { $_ })
+        if (-not $samples.Count) { Set-Status "Aucune donnée enregistrée sur cette période."; return }
+        $ui.BbAnalysis.Visibility = 'Visible'
+        $ui.TxtBbTitle.Text = if ($isCrash) { "Les $minutes minutes avant la coupure (dernier enregistrement à $($samples[-1].Time.ToString('HH:mm:ss')), le $($samples[-1].Time.ToString('dd/MM')))" } else { "Les $minutes dernières minutes" }
+        $ui.TxtBbVerdict.Text = Get-BbVerdict $samples $isCrash
+        $window.UpdateLayout()
+        $lim = ($samples | Where-Object { $_.GpuLimit } | Select-Object -Last 1).GpuLimit
+        $pmax = if ($lim) { [double]$lim * 1.05 } else { 400 }
+        Draw-Chart $ui.ChartGpuTemp @($samples | ForEach-Object { $_.GpuTemp }) 100 '#FFF59E0B' 85
+        Draw-Chart $ui.ChartGpuPower @($samples | ForEach-Object { $_.GpuPower }) $pmax '#FF8B5CF6' $lim
+        Draw-Chart $ui.ChartCpu @($samples | ForEach-Object { $_.Cpu }) 100 '#FF3B6EF5' $null
+        Draw-Chart $ui.ChartRam @($samples | ForEach-Object { $_.Ram }) 100 '#FF22C55E' 95
+        $mx = { param($p, $fmt) $vals = @($samples | ForEach-Object { $_.$p } | Where-Object { $null -ne $_ }); if ($vals.Count) { $fmt -f ($vals | Measure-Object -Maximum).Maximum } else { 'pas de données' } }
+        $ui.ChartGpuTempInfo.Text = & $mx 'GpuTemp' 'max {0:N0} °C'
+        $ui.ChartGpuPowerInfo.Text = (& $mx 'GpuPower' 'max {0:N0} W') + $(if ($lim) { " / limite {0:N0} W" -f $lim } else { '' })
+        $ui.ChartCpuInfo.Text = & $mx 'Cpu' 'max {0:N0} %'
+        $ui.ChartRamInfo.Text = & $mx 'Ram' 'max {0:N0} %'
+        $ui.TxtBbTableTitle.Text = if ($isCrash) { 'Dernières mesures avant la coupure (la plus récente en haut)' } else { 'Dernières mesures (la plus récente en haut)' }
+        $tail = @($samples | Select-Object -Last 45)
+        [array]::Reverse($tail)
+        $ui.GridBbSamples.ItemsSource = $tail
+        $ui.BbAnalysis.BringIntoView()
+    }
+
+    $ui.BtnBbStart.Add_Click({
+            try { Start-BlackBox; Set-Status 'Boîte noire démarrée : icône PC Doctor près de l''horloge.' } catch { Set-Status "Impossible de démarrer la boîte noire : $_" }
+            $script:BbRefreshAt = [DateTime]::Now.AddSeconds(3)
+        })
+    $ui.BtnBbStop.Add_Click({
+            if ([PCDoctor.BlackBox]::RequestStop()) { Set-Status 'Boîte noire arrêtée.' }
+            $script:BbRefreshAt = [DateTime]::Now.AddSeconds(3)
+        })
+    $ui.ChkBbAutostart.Add_Checked({ if (-not $script:Loading) { Set-BlackBoxAutostart $true; Set-Status 'La boîte noire se lancera avec Windows.' } })
+    $ui.ChkBbAutostart.Add_Unchecked({ if (-not $script:Loading) { Set-BlackBoxAutostart $false; Set-Status 'La boîte noire ne se lancera plus avec Windows.' } })
+    $ui.BtnBbLast.Add_Click({ Show-BlackBoxWindow (Get-Date) 10 $false })
+    $ui.GridBbCrashes.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, [System.Windows.RoutedEventHandler] {
+            param($sender, $e)
+            $b = $e.OriginalSource
+            if ($b -is [System.Windows.Controls.Button] -and $b.Tag -eq 'bb-analyze' -and $b.DataContext.HasData) {
+                try { Show-BlackBoxWindow $b.DataContext.CutTime 5 $true } catch { Write-Log "Analyse : $_ $($_.ScriptStackTrace)"; Set-Status "Erreur d'analyse : $_" }
+            }
+        })
+
+    # Alertes
+    $ui.ChkAlerts.Add_Checked({ if (-not $script:Loading) { Set-Setting 'Alerts' '1' } })
+    $ui.ChkAlerts.Add_Unchecked({ if (-not $script:Loading) { Set-Setting 'Alerts' '0' } })
+    $ui.CmbAlertTemp.Add_SelectionChanged({
+            if ($script:Loading -or $ui.CmbAlertTemp.SelectedIndex -lt 0) { return }
+            Set-Setting 'AlertGpuTemp' ([string](75 + 5 * $ui.CmbAlertTemp.SelectedIndex))
+            Set-Status "Seuil d'alerte réglé à $(75 + 5 * $ui.CmbAlertTemp.SelectedIndex) °C."
+        })
+
+    # =====================================================================
+    #  LOGICIELS (winget)
+    # =====================================================================
+    function Start-WingetConsole([string]$wingetArgs, [string]$title) {
+        $wg = Get-WingetPath
+        if (-not $wg) { Set-Status "winget n'est pas disponible sur ce PC."; return }
+        $code = "`$host.UI.RawUI.WindowTitle = '$title'; [Console]::OutputEncoding = [Text.Encoding]::UTF8; Write-Host 'PC Doctor - $title' -ForegroundColor Cyan; Write-Host 'Certains logiciels peuvent demander une confirmation administrateur ou leur fermeture.' -ForegroundColor Yellow; & '$($wg -replace "'", "''")' $wingetArgs; Write-Host ''; Write-Host 'Termine. Vous pouvez fermer cette fenetre.' -ForegroundColor Green"
+        Start-Process -FilePath $script:PowerShellExe -ArgumentList @('-NoProfile', '-NoExit', '-EncodedCommand', (ConvertTo-EncodedCommand $code))
+    }
+
+    function Start-SoftwareSearch {
+        $script:SoftwareLoaded = $true
+        $ui.BtnSwSearch.IsEnabled = $false; $ui.BtnSwAll.IsEnabled = $false
+        $ui.SwBar.Visibility = 'Visible'; $ui.SwBar.IsIndeterminate = $true
+        $ui.TxtSwStatus.Text = 'Recherche des mises à jour…'
+        Start-BgJob 'try { [pscustomobject]@{ Ok = $true; Items = @(Get-WingetUpgrades); Error = $null } } catch { [pscustomobject]@{ Ok = $false; Items = @(); Error = "$_" } }' {
+            param($res)
+            $o = @($res)[0]
+            $ui.SwBar.IsIndeterminate = $false; $ui.SwBar.Visibility = 'Collapsed'
+            $ui.BtnSwSearch.IsEnabled = $true
+            if (-not $o -or -not $o.Ok) { $ui.TxtSwStatus.Text = "Recherche impossible : $(if ($o) { $o.Error })"; return }
+            $items = @($o.Items | Where-Object { $_ })
+            $ui.GridSoftware.ItemsSource = $items
+            $ui.BtnSwAll.IsEnabled = ($items.Count -gt 0)
+            $ui.TxtSwStatus.Text = if ($items.Count) { "$($items.Count) logiciel(s) peuvent être mis à jour." } else { 'Tous vos logiciels sont à jour.' }
+            Set-Badge $ui.BadgeSoftware $ui.BadgeSoftwareText $items.Count
+        }
+    }
+    $ui.BtnSwSearch.Add_Click({ Start-SoftwareSearch })
+    $ui.BtnSwAll.Add_Click({
+            $n = @($ui.GridSoftware.ItemsSource).Count
+            $r = [System.Windows.MessageBox]::Show("Mettre à jour les $n logiciels ?`n`nUne fenêtre va afficher la progression. Fermez si possible les programmes concernés (navigateur, launchers…). Certains installeurs demanderont les droits administrateur.", 'Tout mettre à jour', 'YesNo', 'Question')
+            if ($r -ne 'Yes') { return }
+            Start-WingetConsole 'upgrade --all --include-unknown --source winget --accept-source-agreements --accept-package-agreements' 'Mise a jour des logiciels'
+            $ui.TxtSwStatus.Text = 'Mise à jour lancée dans une fenêtre séparée. Cliquez sur « Rechercher » quand elle est terminée.'
+        })
+    $ui.GridSoftware.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, [System.Windows.RoutedEventHandler] {
+            param($sender, $e)
+            $b = $e.OriginalSource
+            if ($b -is [System.Windows.Controls.Button] -and $b.Tag -eq 'sw-update') {
+                $id = [string]$b.DataContext.Id
+                if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') { return }
+                Start-WingetConsole "upgrade --id $id --exact --source winget --accept-source-agreements --accept-package-agreements" "Mise a jour de $id"
+                Set-Status "Mise à jour de « $($b.DataContext.Name) » lancée dans une fenêtre séparée."
+            }
+        })
+
+    # =====================================================================
+    #  RÉSEAU
+    # =====================================================================
+    function Show-Network($n) {
+        $ui.TxtNetType.Text = "$($n.Type)$(if ($n.LinkSpeed) { "  ·  $($n.LinkSpeed)" })"
+        $det = @("Carte : $($n.Adapter)")
+        if ($n.IsWifi -and $null -ne $n.Signal) { $det += "Signal Wi-Fi : $($n.Signal) %" }
+        if ($n.Gateway) { $det += "Box / routeur : $($n.Gateway)" }
+        $ui.TxtNetDetail.Text = $det -join "`n"
+        $ui.GridNet.ItemsSource = @($n.Results)
+        $local = @($n.Results | Where-Object { $_.Scope -eq 'local' }) | Select-Object -First 1
+        $inet = @($n.Results | Where-Object { $_.Scope -eq 'internet' })
+        $best = $inet | Where-Object { $null -ne $_.Avg } | Sort-Object Avg | Select-Object -First 1
+        if ($local -and $local.Verdict -ne 'Bon') {
+            $ui.TxtNetVerdictTitle.Text = 'Problème entre le PC et la box'
+            $ui.TxtNetVerdict.Text = if ($n.IsWifi) { "La liaison Wi-Fi avec la box est instable ($($local.AvgText), pertes $($local.LossText)). Rapprochez le PC de la box, passez sur le Wi-Fi 5 GHz ou, idéalement, branchez un câble Ethernet." } else { "La liaison avec la box n'est pas normale pour un câble ($($local.AvgText), pertes $($local.LossText)). Essayez un autre câble ou un autre port, et redémarrez la box." }
+        } elseif (@($inet | Where-Object { $_.Verdict -eq 'Mauvais' }).Count -eq $inet.Count) {
+            $ui.TxtNetVerdictTitle.Text = 'Connexion Internet mauvaise'
+            $ui.TxtNetVerdict.Text = "Votre réseau local est bon, mais la connexion Internet elle-même est lente ou instable. Redémarrez la box ; si ça continue, contactez votre fournisseur d'accès."
+        } elseif (@($inet | Where-Object { $_.Verdict -ne 'Bon' }).Count) {
+            $ui.TxtNetVerdictTitle.Text = 'Connexion correcte'
+            $ui.TxtNetVerdict.Text = "Ça fonctionne, avec quelques variations (gigue ou pertes ponctuelles). Si ça laggue en jeu aux heures de pointe, c'est souvent le réseau de votre fournisseur."
+        } else {
+            $ui.TxtNetVerdictTitle.Text = 'Excellente connexion'
+            $ui.TxtNetVerdict.Text = "Ping de $($best.AvgText), stable et sans perte. Si un jeu laggue quand même, le problème vient du serveur du jeu ou du PC lui-même (regardez la page Processus)."
+        }
+        if ($n.IsWifi -and $null -ne $n.Signal -and $n.Signal -lt 60) { $ui.TxtNetVerdict.Text += "`nLe signal Wi-Fi est faible ($($n.Signal) %)." }
+        $dns = if ($n.DnsServers.Count) { $n.DnsServers -join ', ' } else { 'automatique' }
+        $ui.TxtNetDns.Text = if ($null -eq $n.DnsMs) { "Serveurs DNS : $dns. Mesure impossible." }
+        elseif ($n.DnsMs -gt 80) { "Serveurs DNS : $dns. Réponse lente ({0:N0} ms) : passer à Cloudflare (1.1.1.1) ou Google (8.8.8.8) accélère l'ouverture des sites." -f $n.DnsMs }
+        else { "Serveurs DNS : $dns. Réponse rapide ({0:N0} ms), rien à changer." -f $n.DnsMs }
+    }
+    $ui.BtnNetTest.Add_Click({
+            $ui.BtnNetTest.IsEnabled = $false
+            $ui.NetBar.Visibility = 'Visible'; $ui.NetBar.IsIndeterminate = $true
+            $ui.TxtNetStatus.Text = 'Test en cours (environ 10 secondes)…'
+            Start-BgJob 'Test-NetworkQuality' {
+                param($res)
+                $ui.NetBar.IsIndeterminate = $false; $ui.NetBar.Visibility = 'Collapsed'
+                $ui.BtnNetTest.IsEnabled = $true
+                $n = @($res)[0]
+                if (-not $n) { $ui.TxtNetStatus.Text = 'Le test a échoué.'; return }
+                Show-Network $n
+                $ui.TxtNetStatus.Text = "Test terminé à $(Get-Date -Format 'HH:mm')."
+            }
+        })
+
+    # =====================================================================
+    #  PARAMÈTRES, THÈME ET MISES À JOUR
+    # =====================================================================
+    function Restart-App {
+        if ($script:IsAdmin) { Start-ElevatedSelf }
+        else {
+            $c = Get-LaunchCommand
+            $psi = New-Object Diagnostics.ProcessStartInfo($c.Exe, $c.Args)
+            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            [void][Diagnostics.Process]::Start($psi)
+        }
+        $window.Close()
+    }
+    function Set-Theme([string]$t) {
+        if (((Get-Settings)['Theme']) -eq $t) { return }
+        Set-Setting 'Theme' $t
+        Restart-App
+    }
+    $ui.BtnThemeLight.Add_Click({ Set-Theme 'light' })
+    $ui.BtnThemeDark.Add_Click({ Set-Theme 'dark' })
+    $ui.BtnOpenData.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$script:LogDir`"" })
+    $ui.SettingsRoot.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
+    $ui.NetRoot.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, $clickHandler)
+    $ui.ChkCheckUpdates.Add_Checked({ if (-not $script:Loading) { Set-Setting 'CheckUpdates' '1' } })
+    $ui.ChkCheckUpdates.Add_Unchecked({ if (-not $script:Loading) { Set-Setting 'CheckUpdates' '0' } })
+
+    $script:UpdateInfo = $null
+    function Start-UpdateCheck([bool]$manual) {
+        $ui.TxtUpdateStatus.Text = 'Vérification en cours…'
+        $code = 'try { $r = Invoke-RestMethod -Uri "https://api.github.com/repos/' + $script:Repo + '/releases/latest" -Headers @{ "User-Agent" = "PCDoctor"; "Accept" = "application/vnd.github+json" } -TimeoutSec 15 -UseBasicParsing; [pscustomobject]@{ Ok = $true; Tag = [string]$r.tag_name; Body = [string]$r.body; Url = [string]$r.html_url; Assets = @($r.assets | ForEach-Object { [pscustomobject]@{ Name = [string]$_.name; Url = [string]$_.browser_download_url } }) } } catch { [pscustomobject]@{ Ok = $false; Error = "$_" } }'
+        Start-BgJob $code {
+            param($res)
+            $o = @($res)[0]
+            if (-not $o -or -not $o.Ok) { $ui.TxtUpdateStatus.Text = "Vérification impossible (pas de connexion ?)."; return }
+            $remote = $null
+            try { $remote = [version]($o.Tag.TrimStart('v', 'V')) } catch {}
+            if ($remote -and $remote -gt [version]$script:AppVersion) {
+                $script:UpdateInfo = $o
+                $ui.UpdateBanner.Visibility = 'Visible'
+                $ui.TxtUpdateTitle.Text = "PC Doctor $remote est disponible"
+                $ui.TxtUpdateSub.Text = "Vous avez la version $($script:AppVersion). La mise à jour prend quelques secondes et relance l'appli."
+                $ui.TxtUpdateStatus.Text = "Nouvelle version disponible : $remote."
+                $ui.BtnInstallUpdate.Visibility = 'Visible'
+                Set-Badge $ui.BadgeSettings $ui.BadgeSettingsText 1
+            } else {
+                $ui.TxtUpdateStatus.Text = "Vous avez la dernière version (vérifié à $(Get-Date -Format 'HH:mm'))."
+                Set-Badge $ui.BadgeSettings $ui.BadgeSettingsText 0
+            }
+        }
+    }
+
+    function Install-Update {
+        $u = $script:UpdateInfo
+        if (-not $u) { return }
+        $asset = @($u.Assets | Where-Object { $_.Name -like '*.exe' -and $_.Url -like "https://github.com/$($script:Repo)/releases/download/*" }) | Select-Object -First 1
+        $expected = if ($u.Body -match '\b([A-Fa-f0-9]{64})\b') { $Matches[1].ToUpper() } else { $null }
+        if (-not $ExePath -or -not (Test-Path -LiteralPath $ExePath) -or -not $asset -or -not $expected) {
+            Start-Process $u.Url
+            Set-Status 'Page de la nouvelle version ouverte : téléchargez PC-Doctor.exe et remplacez l''ancien.'
+            return
+        }
+        $r = [System.Windows.MessageBox]::Show("Installer PC Doctor $($u.Tag) ?`n`nLe nouvel exécutable va être téléchargé depuis GitHub, vérifié (SHA-256), puis il remplacera :`n$ExePath`n`nL'appli va se relancer.", 'Mise à jour', 'YesNo', 'Question')
+        if ($r -ne 'Yes') { return }
+        $ui.BtnUpdateNow.IsEnabled = $false; $ui.BtnInstallUpdate.IsEnabled = $false
+        Set-Status 'Téléchargement de la mise à jour…'
+        $script:UpdateTmp = "$ExePath.download"
+        $script:UpdateExpected = $expected
+        $code = "Invoke-WebRequest -UseBasicParsing -Uri '$($asset.Url -replace "'", "''")' -OutFile '$($script:UpdateTmp -replace "'", "''")' -Headers @{ 'User-Agent' = 'PCDoctor' } -TimeoutSec 120; (Get-FileHash -LiteralPath '$($script:UpdateTmp -replace "'", "''")' -Algorithm SHA256).Hash"
+        Start-BgJob $code {
+            param($res)
+            $hash = [string](@($res) | Select-Object -Last 1)
+            $ui.BtnUpdateNow.IsEnabled = $true; $ui.BtnInstallUpdate.IsEnabled = $true
+            if (-not (Test-Path -LiteralPath $script:UpdateTmp) -or $hash -ne $script:UpdateExpected) {
+                Remove-Item -LiteralPath $script:UpdateTmp -Force -ErrorAction SilentlyContinue
+                [System.Windows.MessageBox]::Show("Le téléchargement a échoué ou le fichier ne correspond pas à l'empreinte publiée. Rien n'a été modifié.", 'Mise à jour', 'OK', 'Warning') | Out-Null
+                return
+            }
+            try {
+                Move-Item -LiteralPath $script:UpdateTmp -Destination $ExePath -Force
+                if ([PCDoctor.BlackBox]::IsRunning()) { [void][PCDoctor.BlackBox]::RequestStop(); Start-Sleep -Milliseconds 2500; Start-BlackBox }
+                Start-Process -FilePath $ExePath
+                $window.Close()
+            } catch {
+                Remove-Item -LiteralPath $script:UpdateTmp -Force -ErrorAction SilentlyContinue
+                [System.Windows.MessageBox]::Show("Impossible de remplacer le fichier ($($_.Exception.Message)). Téléchargez la nouvelle version depuis la page GitHub.", 'Mise à jour', 'OK', 'Warning') | Out-Null
+                Start-Process $script:UpdateInfo.Url
+            }
+        }
+    }
+    $ui.BtnUpdateNow.Add_Click({ Install-Update })
+    $ui.BtnInstallUpdate.Add_Click({ Install-Update })
+    $ui.BtnCheckUpdate.Add_Click({ Start-UpdateCheck $true })
+
+    # --- État initial des réglages ---
+    $cfg = Get-Settings
+    $ui.TxtAppVersion.Text = "Version installée : $($script:AppVersion)"
+    $ui.TxtVersion.Text = "PC Doctor $($script:AppVersion)"
+    $ui.TxtThemeInfo.Text = if ($script:IsDark) { 'Thème sombre activé. Changer de thème relance l''appli.' } else { 'Thème clair activé. Changer de thème relance l''appli.' }
+    $ui.TxtDataInfo.Text = "Réglages, journal et enregistrements de la boîte noire : $($script:LogDir)"
+    $ui.ChkCheckUpdates.IsChecked = ($cfg['CheckUpdates'] -ne '0')
+    $ui.ChkAlerts.IsChecked = ($cfg['Alerts'] -ne '0')
+    $t = 85; [void][int]::TryParse($cfg['AlertGpuTemp'], [ref]$t)
+    $ui.CmbAlertTemp.SelectedIndex = [math]::Max(0, [math]::Min(3, [int](($t - 75) / 5)))
+    Set-Badge $ui.BadgeSettings $ui.BadgeSettingsText 0
+    if (Test-BlackBoxAutostart) { try { Set-BlackBoxAutostart $true } catch {} }   # met à jour le chemin si l'exe a été déplacé
+    $script:Loading = $false
+    try { Update-BlackBoxStatus } catch {}
+
+    $window.Add_Loaded({
+            Start-FullAnalysis
+            if ((Get-Settings)['CheckUpdates'] -ne '0') { Start-UpdateCheck $false }
+        })
     $window.Add_Closing({ [PCDoctor.DiskScanner]::Cancel = $true; $script:Timer.Stop() })
 
     $script:Timer.Start()

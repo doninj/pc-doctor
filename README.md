@@ -22,15 +22,21 @@
 |---|---|
 | **Diagnostic** | Score de santé sur 100, processeur, RAM, disque, temps depuis l'allumage, et la liste des problèmes trouvés avec un bouton pour chacun. |
 | **Solutions** | Solutions aux plantages, classées selon ce qui a été détecté (RAM/EXPO, températures, alimentation, pilote graphique, BIOS…). Beaucoup s'appliquent en un clic depuis l'appli. |
+| **Boîte noire** | Enregistre l'état du PC toutes les 2 s (température et consommation GPU, processeur, RAM, programme utilisé) depuis la zone de notification. Après une coupure : courbes des 5 minutes précédentes et verdict (surchauffe, pic de consommation, PC au repos…). Alertes Windows si la carte graphique chauffe trop ou si la RAM sature. |
 | **Pilotes** | Mises à jour de pilotes disponibles sur Windows Update (cocher, puis installer), pilote de la carte graphique, périphériques en erreur, pilotes anciens. |
-| **Performances** | Carte graphique NVIDIA en direct (température, consommation, fréquence) avec la température max enregistrée, limite de puissance réglable, état de la RAM (EXPO/XMP activé ou non), logiciels d'overclocking présents, mode d'alimentation. |
+| **Logiciels** | Mise à jour de tous les logiciels en un clic (ou un par un) avec winget. |
+| **Performances** | Carte graphique NVIDIA en direct (température, consommation, fréquence) avec la température max enregistrée, limite de puissance réglable, état de la RAM (EXPO/XMP activé ou non), logiciels d'overclocking, mode d'alimentation, **santé des disques** (température, usure des SSD, erreurs, heures d'utilisation). |
+| **Réseau** | Test de ping, gigue et pertes vers la box et Internet, vitesse DNS, et diagnostic (Wi-Fi, box ou fournisseur d'accès). |
 | **Démarrage** | Programmes lancés avec Windows, avec un conseil pour chacun (désactivable, au choix, à garder) et un bouton Activer/Désactiver. |
 | **Processus** | Ce qui consomme la RAM et le processeur, regroupé par programme. |
 | **Plantages** | Écrans bleus, coupures nettes, logiciels qui plantent et erreurs disque des 30 derniers jours. |
 | **Espace disque** | Quels dossiers et fichiers prennent le plus de place (navigation par double-clic, plus gros fichiers, répartition par type). |
 | **Nettoyage** | Fichiers temporaires, caches, corbeille : combien de place on peut récupérer, et nettoyage en un clic. |
+| **Paramètres** | Thème clair / sombre, mise à jour automatique de PC Doctor (vérifiée par empreinte SHA-256). |
 
 Rien n'est modifié sans confirmation. Les réglages (démarrage, limite de puissance, démarrage rapide…) sont réversibles.
+
+Mode surveillance seul (boîte noire, sans fenêtre) : `"PC Doctor.exe" --monitor`.
 
 ## Installation
 

@@ -1,4 +1,4 @@
-// Lanceur de PC Doctor : contient le script et le logo, les extrait dans
+﻿// Lanceur de PC Doctor : contient le script et le logo, les extrait dans
 // %LOCALAPPDATA%\PCDoctor\app puis démarre l'interface sans fenêtre console.
 using System;
 using System.Diagnostics;
@@ -9,8 +9,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("PC Doctor")]
 [assembly: AssemblyProduct("PC Doctor")]
 [assembly: AssemblyDescription("Diagnostic du PC : lenteurs, plantages, pilotes, espace disque")]
-[assembly: AssemblyVersion("2.1.0.0")]
-[assembly: AssemblyFileVersion("2.1.0.0")]
+[assembly: AssemblyVersion("2.2.0.0")]
+[assembly: AssemblyFileVersion("2.2.0.0")]
 
 static class Program {
     [STAThread]
@@ -23,7 +23,11 @@ static class Program {
             Extract("PCDoctor.png", Path.Combine(dir, "PCDoctor.png"));
 
             string ps = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
-            ProcessStartInfo psi = new ProcessStartInfo(ps, "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File \"" + script + "\"");
+            string self = Assembly.GetExecutingAssembly().Location;
+            bool monitor = Array.IndexOf(args, "--monitor") >= 0;   // boîte noire (icône de notification, sans fenêtre)
+            string psArgs = "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File \"" + script + "\" -ExePath \"" + self + "\"";
+            if (monitor) psArgs += " -Monitor";
+            ProcessStartInfo psi = new ProcessStartInfo(ps, psArgs);
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             psi.WorkingDirectory = dir;
