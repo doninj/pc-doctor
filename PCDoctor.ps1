@@ -3052,7 +3052,7 @@ $xamlText = @'
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
                 <Setter TargetName="Bd" Property="Background" Value="#FF162036"/>
-                <Setter Property="Foreground" Value="#FFE2E8F0"/>
+                <Setter Property="Foreground" Value="#FFE4E9F1"/>
               </Trigger>
               <Trigger Property="IsSelected" Value="True">
                 <Setter TargetName="Bd" Property="Background" Value="#FF1E2A47"/>
