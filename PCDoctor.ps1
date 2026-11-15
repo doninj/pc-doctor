@@ -1113,7 +1113,7 @@ if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp
 # ---------------------------------------------------------------------------
 #  Réglages partagés (appli + boîte noire) : %LOCALAPPDATA%\PCDoctor\settings.ini
 # ---------------------------------------------------------------------------
-$script:AppVersion = '2.8.0'
+$script:AppVersion = '2.9.0'
 $script:Repo = 'doninj/pc-doctor'
 $script:SettingsFile = Join-Path $script:LogDir 'settings.ini'
 $script:BlackBoxDir = Join-Path $script:LogDir 'boite-noire'
@@ -2778,11 +2778,11 @@ $xamlText = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="PC Doctor" Width="1280" Height="820" MinWidth="1000" MinHeight="640"
-        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="13"
+        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="14"
         Background="#FFF4F6FA" Foreground="#FF0F172A" UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
   <Window.Resources>
     <FontFamily x:Key="Icons">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
-    <SolidColorBrush x:Key="Muted" Color="#FF64748B"/>
+    <SolidColorBrush x:Key="Muted" Color="#FF475569"/>
     <SolidColorBrush x:Key="Line" Color="#FFE2E8F0"/>
     <SolidColorBrush x:Key="Accent" Color="#FF3B6EF5"/>
 
@@ -2832,10 +2832,11 @@ $xamlText = @'
       <Setter Property="FontFamily" Value="Segoe UI Variable Display, Segoe UI"/>
     </Style>
     <Style x:Key="PageSub" TargetType="TextBlock">
-      <Setter Property="Foreground" Value="#FF64748B"/>
+      <Setter Property="Foreground" Value="#FF475569"/>
       <Setter Property="TextWrapping" Value="Wrap"/>
-      <Setter Property="Margin" Value="0,4,0,0"/>
-      <Setter Property="FontSize" Value="13.5"/>
+      <Setter Property="Margin" Value="0,6,0,0"/>
+      <Setter Property="FontSize" Value="14.5"/>
+      <Setter Property="LineHeight" Value="22"/>
     </Style>
     <Style x:Key="Section" TargetType="TextBlock">
       <Setter Property="FontSize" Value="16"/>
@@ -2843,7 +2844,29 @@ $xamlText = @'
       <Setter Property="Margin" Value="0,0,0,10"/>
     </Style>
     <Style x:Key="MutedText" TargetType="TextBlock">
-      <Setter Property="Foreground" Value="#FF64748B"/>
+      <Setter Property="Foreground" Value="#FF475569"/>
+    </Style>
+    <!-- Lien « Détails / Masquer » qui déplie une explication -->
+    <Style x:Key="DetailsToggle" TargetType="ToggleButton">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Foreground" Value="#FF3B6EF5"/>
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ToggleButton">
+            <StackPanel Orientation="Horizontal" Background="Transparent">
+              <TextBlock x:Name="T" Text="Détails" FontSize="13" FontWeight="SemiBold" Foreground="{TemplateBinding Foreground}"/>
+              <TextBlock x:Name="C" Text="&#xE70D;" FontFamily="{StaticResource Icons}" FontSize="10" Margin="6,4,0,0" Foreground="{TemplateBinding Foreground}"/>
+            </StackPanel>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="T" Property="Text" Value="Masquer"/>
+                <Setter TargetName="C" Property="Text" Value="&#xE70E;"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
     <Style x:Key="Wrap" TargetType="TextBlock">
       <Setter Property="TextWrapping" Value="Wrap"/>
@@ -2855,7 +2878,7 @@ $xamlText = @'
     <Style x:Key="Card" TargetType="Border">
       <Setter Property="Background" Value="White"/>
       <Setter Property="CornerRadius" Value="12"/>
-      <Setter Property="Padding" Value="18,16"/>
+      <Setter Property="Padding" Value="20,18"/>
       <Setter Property="BorderBrush" Value="#FFE6EAF0"/>
       <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="Effect">
@@ -3298,12 +3321,16 @@ $xamlText = @'
                         </Border>
                         <Button x:Name="Act" DockPanel.Dock="Right" Style="{StaticResource Small}" Content="{Binding ActionLabel, Mode=OneWay}" Tag="{Binding ActionId, Mode=OneWay}" VerticalAlignment="Center" Margin="14,0,0,0"/>
                         <StackPanel VerticalAlignment="Center">
-                          <TextBlock Text="{Binding Title, Mode=OneWay}" FontWeight="SemiBold" FontSize="14.5" TextWrapping="Wrap"/>
-                          <TextBlock Text="{Binding Advice, Mode=OneWay}" TextWrapping="Wrap" Margin="0,3,0,0" Foreground="#FF475569"/>
+                          <TextBlock Text="{Binding Title, Mode=OneWay}" FontWeight="SemiBold" FontSize="15" TextWrapping="Wrap"/>
+                          <ToggleButton x:Name="Tg" Style="{StaticResource DetailsToggle}" HorizontalAlignment="Left" Margin="0,5,0,0"/>
+                          <TextBlock x:Name="Adv" Text="{Binding Advice, Mode=OneWay}" TextWrapping="Wrap" Margin="0,8,0,0" Foreground="#FF475569" LineHeight="22" Visibility="Collapsed"/>
                         </StackPanel>
                       </DockPanel>
                     </Border>
                     <DataTemplate.Triggers>
+                      <Trigger SourceName="Tg" Property="IsChecked" Value="True"><Setter TargetName="Adv" Property="Visibility" Value="Visible"/></Trigger>
+                      <DataTrigger Binding="{Binding Advice}" Value="{x:Null}"><Setter TargetName="Tg" Property="Visibility" Value="Collapsed"/></DataTrigger>
+                      <DataTrigger Binding="{Binding Advice}" Value=""><Setter TargetName="Tg" Property="Visibility" Value="Collapsed"/></DataTrigger>
                       <DataTrigger Binding="{Binding ActionLabel}" Value="{x:Null}"><Setter TargetName="Act" Property="Visibility" Value="Collapsed"/></DataTrigger>
                       <DataTrigger Binding="{Binding Severity}" Value="Critique">
                         <Setter TargetName="IconBg" Property="Background" Value="#FFFEECEC"/>
@@ -3334,7 +3361,7 @@ $xamlText = @'
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel Margin="32,28,32,24">
               <TextBlock Style="{StaticResource PageTitle}" Text="Résoudre les plantages"/>
-              <TextBlock Style="{StaticResource PageSub}" Text="Des solutions classées selon ce qui a été détecté sur votre PC. Faites-les dans l'ordre, une à la fois."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="À faire dans l'ordre, une à la fois."/>
               <Border Style="{StaticResource Card}" Margin="0,18,0,20" Background="#FF0F1A33" BorderBrush="#FF0F1A33">
                 <DockPanel>
                   <TextBlock Text="&#xE9D9;" FontFamily="{StaticResource Icons}" FontSize="22" Foreground="#FF7EA2FF" DockPanel.Dock="Left" VerticalAlignment="Top" Margin="0,2,14,0"/>
@@ -3359,9 +3386,10 @@ $xamlText = @'
                               <TextBlock Text="Recommandé pour votre PC" FontSize="11.5" FontWeight="SemiBold" Foreground="#FF3B6EF5"/>
                             </Border>
                           </WrapPanel>
-                          <TextBlock Text="{Binding Why, Mode=OneWay}" TextWrapping="Wrap" Foreground="#FF475569" Margin="0,6,0,0"/>
-                          <Border Background="#FFF7F9FC" CornerRadius="8" Padding="14,10" Margin="0,12,0,0">
-                            <TextBlock Text="{Binding Steps, Mode=OneWay}" TextWrapping="Wrap" LineHeight="21"/>
+                          <TextBlock Text="{Binding Why, Mode=OneWay}" TextWrapping="Wrap" Foreground="#FF475569" Margin="0,6,0,0" LineHeight="22"/>
+                          <ToggleButton x:Name="TgSteps" Style="{StaticResource DetailsToggle}" HorizontalAlignment="Left" Margin="0,8,0,0" IsChecked="{Binding Recommended, Mode=OneTime}"/>
+                          <Border x:Name="StepsBox" Background="#FFF7F9FC" CornerRadius="8" Padding="14,10" Margin="0,10,0,0" Visibility="Collapsed">
+                            <TextBlock Text="{Binding Steps, Mode=OneWay}" TextWrapping="Wrap" LineHeight="22"/>
                           </Border>
                           <ItemsControl ItemsSource="{Binding Actions, Mode=OneWay}" Margin="0,12,0,0">
                             <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
@@ -3375,6 +3403,7 @@ $xamlText = @'
                       </DockPanel>
                     </Border>
                     <DataTemplate.Triggers>
+                      <Trigger SourceName="TgSteps" Property="IsChecked" Value="True"><Setter TargetName="StepsBox" Property="Visibility" Value="Visible"/></Trigger>
                       <DataTrigger Binding="{Binding Recommended}" Value="True">
                         <Setter TargetName="RecBadge" Property="Visibility" Value="Visible"/>
                         <Setter TargetName="NumBg" Property="Background" Value="#FF3B6EF5"/>
@@ -3393,7 +3422,7 @@ $xamlText = @'
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="BlackBoxRoot" Margin="32,28,32,24">
               <TextBlock Style="{StaticResource PageTitle}" Text="Boîte noire"/>
-              <TextBlock Style="{StaticResource PageSub}" Text="PC Doctor enregistre discrètement l'état du PC toutes les 2 secondes : carte graphique (température, consommation), processeur, mémoire et programme utilisé. Après une coupure, vous voyez ce qui se passait juste avant."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Enregistre l'état du PC toutes les 2 secondes. Après une coupure, vous voyez ce qui se passait juste avant."/>
               <Grid Margin="0,18,0,20">
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="*"/>
@@ -3538,7 +3567,7 @@ $xamlText = @'
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="StressRoot" Margin="32,28,32,24">
               <TextBlock Style="{StaticResource PageTitle}" Text="Test de stabilité"/>
-              <TextBlock Style="{StaticResource PageSub}" Text="Fait tourner le processeur, la mémoire vive et la carte graphique à fond pendant quelques minutes, en surveillant les températures. Si le PC se coupe pendant le test, le problème est reproduit et la boîte noire montre pourquoi."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Fait tourner le PC à fond quelques minutes. S'il se coupe, la boîte noire montre pourquoi."/>
               <Border x:Name="StressCrashBox" Background="#FFFEF2F2" BorderBrush="#FFFBCACA" BorderThickness="1" CornerRadius="12" Padding="18,14" Margin="0,18,0,0" Visibility="Collapsed">
                 <DockPanel>
                   <Button x:Name="BtnStressCrashBb" DockPanel.Dock="Right" Content="Voir la boîte noire" VerticalAlignment="Center" Margin="12,0,0,0"/>
@@ -3660,7 +3689,7 @@ $xamlText = @'
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="SecurityRoot" Margin="32,28,32,24">
               <TextBlock Style="{StaticResource PageTitle}" Text="Sécurité"/>
-              <TextBlock Style="{StaticResource PageSub}" Text="Antivirus, pare-feu, mises à jour et réglages de Windows qui protègent le PC. PC Doctor ne fait que vérifier : rien n'est modifié sans votre accord."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Ce qui protège le PC. Rien n'est modifié sans votre accord."/>
               <Grid Margin="0,18,0,24">
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="300"/>
@@ -3720,12 +3749,16 @@ $xamlText = @'
                         </Border>
                         <Button x:Name="Act" DockPanel.Dock="Right" Style="{StaticResource Small}" Content="{Binding ActionLabel, Mode=OneWay}" Tag="{Binding ActionId, Mode=OneWay}" VerticalAlignment="Center" Margin="14,0,0,0"/>
                         <StackPanel VerticalAlignment="Center">
-                          <TextBlock Text="{Binding Title, Mode=OneWay}" FontWeight="SemiBold" FontSize="14.5" TextWrapping="Wrap"/>
-                          <TextBlock Text="{Binding Advice, Mode=OneWay}" TextWrapping="Wrap" Margin="0,3,0,0" Foreground="#FF475569"/>
+                          <TextBlock Text="{Binding Title, Mode=OneWay}" FontWeight="SemiBold" FontSize="15" TextWrapping="Wrap"/>
+                          <ToggleButton x:Name="Tg" Style="{StaticResource DetailsToggle}" HorizontalAlignment="Left" Margin="0,5,0,0"/>
+                          <TextBlock x:Name="Adv" Text="{Binding Advice, Mode=OneWay}" TextWrapping="Wrap" Margin="0,8,0,0" Foreground="#FF475569" LineHeight="22" Visibility="Collapsed"/>
                         </StackPanel>
                       </DockPanel>
                     </Border>
                     <DataTemplate.Triggers>
+                      <Trigger SourceName="Tg" Property="IsChecked" Value="True"><Setter TargetName="Adv" Property="Visibility" Value="Visible"/></Trigger>
+                      <DataTrigger Binding="{Binding Advice}" Value="{x:Null}"><Setter TargetName="Tg" Property="Visibility" Value="Collapsed"/></DataTrigger>
+                      <DataTrigger Binding="{Binding Advice}" Value=""><Setter TargetName="Tg" Property="Visibility" Value="Collapsed"/></DataTrigger>
                       <DataTrigger Binding="{Binding ActionLabel}" Value="{x:Null}"><Setter TargetName="Act" Property="Visibility" Value="Collapsed"/></DataTrigger>
                       <DataTrigger Binding="{Binding Severity}" Value="Critique">
                         <Setter TargetName="IconBg" Property="Background" Value="#FFFEECEC"/>
@@ -3756,7 +3789,7 @@ $xamlText = @'
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="GamingRoot" Margin="32,28,32,24">
               <TextBlock Style="{StaticResource PageTitle}" Text="Jeu et confort"/>
-              <TextBlock Style="{StaticResource PageSub}" Text="Les réglages de Windows qui comptent en jeu et au quotidien. Chaque réglage se change en un clic et se remet aussi facilement : rien n'est modifié sans que vous cliquiez."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Réglages utiles en jeu et au quotidien. Chacun se change et se remet en un clic."/>
               <Border Style="{StaticResource Card}" Margin="0,18,0,20">
                 <DockPanel>
                   <Button x:Name="BtnGamingApply" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="16,0,0,0">
@@ -3779,12 +3812,16 @@ $xamlText = @'
                         </Border>
                         <Button x:Name="Act" DockPanel.Dock="Right" Style="{StaticResource Small}" Content="{Binding ActionLabel, Mode=OneWay}" Tag="{Binding ActionId, Mode=OneWay}" VerticalAlignment="Center" Margin="14,0,0,0"/>
                         <StackPanel VerticalAlignment="Center">
-                          <TextBlock Text="{Binding Title, Mode=OneWay}" FontWeight="SemiBold" FontSize="14.5" TextWrapping="Wrap"/>
-                          <TextBlock Text="{Binding Advice, Mode=OneWay}" TextWrapping="Wrap" Margin="0,3,0,0" Foreground="#FF475569"/>
+                          <TextBlock Text="{Binding Title, Mode=OneWay}" FontWeight="SemiBold" FontSize="15" TextWrapping="Wrap"/>
+                          <ToggleButton x:Name="Tg" Style="{StaticResource DetailsToggle}" HorizontalAlignment="Left" Margin="0,5,0,0"/>
+                          <TextBlock x:Name="Adv" Text="{Binding Advice, Mode=OneWay}" TextWrapping="Wrap" Margin="0,8,0,0" Foreground="#FF475569" LineHeight="22" Visibility="Collapsed"/>
                         </StackPanel>
                       </DockPanel>
                     </Border>
                     <DataTemplate.Triggers>
+                      <Trigger SourceName="Tg" Property="IsChecked" Value="True"><Setter TargetName="Adv" Property="Visibility" Value="Visible"/></Trigger>
+                      <DataTrigger Binding="{Binding Advice}" Value="{x:Null}"><Setter TargetName="Tg" Property="Visibility" Value="Collapsed"/></DataTrigger>
+                      <DataTrigger Binding="{Binding Advice}" Value=""><Setter TargetName="Tg" Property="Visibility" Value="Collapsed"/></DataTrigger>
                       <DataTrigger Binding="{Binding ActionLabel}" Value="{x:Null}"><Setter TargetName="Act" Property="Visibility" Value="Collapsed"/></DataTrigger>
                       <DataTrigger Binding="{Binding Severity}" Value="Critique">
                         <Setter TargetName="IconBg" Property="Background" Value="#FFFEECEC"/>
@@ -3817,12 +3854,16 @@ $xamlText = @'
                         </Border>
                         <Button x:Name="Act" DockPanel.Dock="Right" Style="{StaticResource Small}" Content="{Binding ActionLabel, Mode=OneWay}" Tag="{Binding ActionId, Mode=OneWay}" VerticalAlignment="Center" Margin="14,0,0,0"/>
                         <StackPanel VerticalAlignment="Center">
-                          <TextBlock Text="{Binding Title, Mode=OneWay}" FontWeight="SemiBold" FontSize="14.5" TextWrapping="Wrap"/>
-                          <TextBlock Text="{Binding Advice, Mode=OneWay}" TextWrapping="Wrap" Margin="0,3,0,0" Foreground="#FF475569"/>
+                          <TextBlock Text="{Binding Title, Mode=OneWay}" FontWeight="SemiBold" FontSize="15" TextWrapping="Wrap"/>
+                          <ToggleButton x:Name="Tg" Style="{StaticResource DetailsToggle}" HorizontalAlignment="Left" Margin="0,5,0,0"/>
+                          <TextBlock x:Name="Adv" Text="{Binding Advice, Mode=OneWay}" TextWrapping="Wrap" Margin="0,8,0,0" Foreground="#FF475569" LineHeight="22" Visibility="Collapsed"/>
                         </StackPanel>
                       </DockPanel>
                     </Border>
                     <DataTemplate.Triggers>
+                      <Trigger SourceName="Tg" Property="IsChecked" Value="True"><Setter TargetName="Adv" Property="Visibility" Value="Visible"/></Trigger>
+                      <DataTrigger Binding="{Binding Advice}" Value="{x:Null}"><Setter TargetName="Tg" Property="Visibility" Value="Collapsed"/></DataTrigger>
+                      <DataTrigger Binding="{Binding Advice}" Value=""><Setter TargetName="Tg" Property="Visibility" Value="Collapsed"/></DataTrigger>
                       <DataTrigger Binding="{Binding ActionLabel}" Value="{x:Null}"><Setter TargetName="Act" Property="Visibility" Value="Collapsed"/></DataTrigger>
                       <DataTrigger Binding="{Binding Severity}" Value="Critique">
                         <Setter TargetName="IconBg" Property="Background" Value="#FFFEECEC"/>
@@ -3853,7 +3894,7 @@ $xamlText = @'
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="DriversRoot" Margin="32,28,32,24">
               <TextBlock Style="{StaticResource PageTitle}" Text="Pilotes"/>
-              <TextBlock Style="{StaticResource PageSub}" Text="Mettez vos pilotes à jour en quelques clics et repérez les périphériques qui ont un problème."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Mises à jour et périphériques en erreur."/>
 
               <Border Style="{StaticResource Card}" Margin="0,18,0,14">
                 <DockPanel>
@@ -3964,7 +4005,7 @@ $xamlText = @'
           <DockPanel Margin="32,28,32,20">
             <StackPanel DockPanel.Dock="Top">
               <TextBlock Style="{StaticResource PageTitle}" Text="Mises à jour des logiciels"/>
-              <TextBlock Style="{StaticResource PageSub}" Text="Mettez à jour vos programmes (navigateurs, launchers, outils…) en un clic, grâce à winget, l'outil officiel de Microsoft. Les installations se font dans une fenêtre qui montre la progression."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Mettez vos programmes à jour en un clic (winget, l'outil de Microsoft)."/>
               <DockPanel Margin="0,16,0,8">
                 <Button x:Name="BtnSwSearch" Content="Rechercher" Style="{StaticResource Secondary}" DockPanel.Dock="Left"/>
                 <Button x:Name="BtnSwAll" DockPanel.Dock="Left" IsEnabled="False">
@@ -4003,7 +4044,7 @@ $xamlText = @'
                 </Button>
                 <TextBlock Style="{StaticResource PageTitle}" Text="Performances et overclocking"/>
               </DockPanel>
-              <TextBlock Style="{StaticResource PageSub}" Text="Voyez ce qui est overclocké sur votre PC et testez la stabilité directement d'ici. Tous les réglages sont réversibles."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Températures, overclocking et santé des disques. Tout est réversible."/>
               <Grid Margin="0,18,0,0">
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="3*"/>
@@ -4156,7 +4197,7 @@ $xamlText = @'
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="NetRoot" Margin="32,28,32,24">
               <TextBlock Style="{StaticResource PageTitle}" Text="Réseau"/>
-              <TextBlock Style="{StaticResource PageSub}" Text="Testez la qualité de votre connexion : latence (ping), stabilité (gigue) et pertes de paquets. Utile quand les jeux en ligne lagguent."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Ping, stabilité et pertes de paquets : utile quand les jeux lagguent."/>
               <DockPanel Margin="0,16,0,8">
                 <Button x:Name="BtnNetTest" DockPanel.Dock="Left">
                   <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE768;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Lancer le test"/></StackPanel>
@@ -4283,7 +4324,7 @@ $xamlText = @'
                       <DataTemplate>
                         <StackPanel Margin="0,8">
                           <TextBlock x:Name="N" Text="{Binding DisplayName, Mode=OneWay}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-                          <TextBlock Text="{Binding Sub, Mode=OneWay}" Foreground="#FF94A3B8" FontSize="11.5" TextTrimming="CharacterEllipsis"/>
+                          <TextBlock Text="{Binding Sub, Mode=OneWay}" Foreground="#FF64748B" FontSize="11.5" TextTrimming="CharacterEllipsis"/>
                         </StackPanel>
                         <DataTemplate.Triggers>
                           <DataTrigger Binding="{Binding Enabled}" Value="False"><Setter TargetName="N" Property="Foreground" Value="#FF94A3B8"/></DataTrigger>
@@ -4351,7 +4392,7 @@ $xamlText = @'
           <DockPanel Margin="32,28,32,20">
             <StackPanel DockPanel.Dock="Top">
               <TextBlock Style="{StaticResource PageTitle}" Text="Processus"/>
-              <TextBlock Style="{StaticResource PageSub}" Text="Programmes regroupés par nom (tous les onglets Chrome ensemble, par exemple). Cliquez sur « Actualiser » au moment où le PC rame pour voir le coupable."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Cliquez sur « Actualiser » quand le PC rame pour voir le coupable."/>
               <WrapPanel Margin="0,16,0,14">
                 <Button x:Name="BtnRefreshProc" Margin="0,0,8,6">
                   <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE72C;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Actualiser"/></StackPanel>
@@ -4367,7 +4408,7 @@ $xamlText = @'
                       <DataTemplate>
                         <StackPanel Margin="0,6">
                           <TextBlock Text="{Binding Description, Mode=OneWay}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-                          <TextBlock Foreground="#FF94A3B8" FontSize="11.5"><Run Text="{Binding Name, Mode=OneWay}"/><Run Text=".exe  ·  "/><Run Text="{Binding Count, Mode=OneWay}"/><Run Text=" instance(s)"/></TextBlock>
+                          <TextBlock Foreground="#FF64748B" FontSize="11.5"><Run Text="{Binding Name, Mode=OneWay}"/><Run Text=".exe  ·  "/><Run Text="{Binding Count, Mode=OneWay}"/><Run Text=" instance(s)"/></TextBlock>
                         </StackPanel>
                       </DataTemplate>
                     </DataGridTemplateColumn.CellTemplate>
@@ -4395,7 +4436,7 @@ $xamlText = @'
                 </Button>
                 <StackPanel>
                   <TextBlock Style="{StaticResource PageTitle}" Text="Plantages"/>
-                  <TextBlock Style="{StaticResource PageSub}" Text="Écrans bleus, coupures, logiciels qui plantent et erreurs disque des 30 derniers jours (journaux de Windows)."/>
+                  <TextBlock Style="{StaticResource PageSub}" Text="Écrans bleus, coupures et logiciels qui plantent (30 derniers jours)."/>
                 </StackPanel>
               </DockPanel>
               <ItemsControl x:Name="ListCrashStats" Margin="0,16,0,14">
@@ -4431,7 +4472,7 @@ $xamlText = @'
           <DockPanel Margin="32,28,32,20">
             <StackPanel DockPanel.Dock="Top">
               <TextBlock Style="{StaticResource PageTitle}" Text="Espace disque"/>
-              <TextBlock Style="{StaticResource PageSub}" Text="Trouvez quels dossiers et quels fichiers prennent le plus de place. Double-cliquez sur un dossier pour entrer dedans."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Ce qui prend le plus de place. Double-cliquez sur un dossier pour l'ouvrir."/>
               <DockPanel Margin="0,16,0,10">
                 <ComboBox x:Name="CmbDrives" Width="340" Margin="0,0,8,0" VerticalContentAlignment="Center" Padding="10,7" DockPanel.Dock="Left"/>
                 <Button x:Name="BtnChooseFolder" Content="Choisir un dossier…" Style="{StaticResource Secondary}" DockPanel.Dock="Left"/>
@@ -4542,7 +4583,7 @@ $xamlText = @'
           <DockPanel Margin="32,28,32,20">
             <StackPanel DockPanel.Dock="Top">
               <TextBlock Style="{StaticResource PageTitle}" Text="Nettoyage"/>
-              <TextBlock Style="{StaticResource PageSub}" Text="Fichiers jetables qui prennent de la place. Rien n'est supprimé sans votre confirmation."/>
+              <TextBlock Style="{StaticResource PageSub}" Text="Fichiers inutiles. Rien n'est supprimé sans confirmation."/>
               <Border Style="{StaticResource Card}" Margin="0,18,0,16">
                 <DockPanel>
                   <Border Width="52" Height="52" CornerRadius="26" Background="#FFE7F8EE" DockPanel.Dock="Left" Margin="0,0,16,0">
@@ -4593,6 +4634,14 @@ $xamlText = @'
                       <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE708;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock Text="Thème sombre"/></StackPanel>
                     </Button>
                   </WrapPanel>
+                  <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                    <TextBlock Text="Taille du texte :" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                    <ComboBox x:Name="CmbTextScale" Width="170" Padding="8,4">
+                      <ComboBoxItem Content="Normale (100 %)"/>
+                      <ComboBoxItem Content="Grande (115 %)"/>
+                      <ComboBoxItem Content="Très grande (130 %)"/>
+                    </ComboBox>
+                  </StackPanel>
                 </StackPanel>
               </Border>
               <Border Style="{StaticResource Card}" Margin="0,0,0,14">
@@ -6491,6 +6540,24 @@ Read-Host 'Appuyez sur Entree pour fermer'
     $ui.TxtThemeInfo.Text = if ($script:IsDark) { 'Thème sombre activé. Changer de thème relance l''appli.' } else { 'Thème clair activé. Changer de thème relance l''appli.' }
     $ui.TxtDataInfo.Text = "Réglages, journal et enregistrements de la boîte noire : $($script:LogDir)"
     $ui.ChkCheckUpdates.IsChecked = ($cfg['CheckUpdates'] -ne '0')
+    # Taille du texte : toute la fenêtre est agrandie (menus et boutons compris)
+    $script:TextScales = @(1.0, 1.15, 1.3)
+    function Set-TextScale([double]$k) {
+        $window.Content.LayoutTransform = New-Object System.Windows.Media.ScaleTransform($k, $k)
+        $wa = [System.Windows.SystemParameters]::WorkArea
+        $window.MinWidth = [math]::Min(1000 * $k, $wa.Width); $window.MinHeight = [math]::Min(640 * $k, $wa.Height)
+        if ($window.Width -lt 1280 * $k) { $window.Width = [math]::Min(1280 * $k, $wa.Width) }
+        if ($window.Height -lt 820 * $k) { $window.Height = [math]::Min(820 * $k, $wa.Height) }
+    }
+    $ts = [Array]::IndexOf(@('100', '115', '130'), [string]$cfg['TextScale']); if ($ts -lt 0) { $ts = 0 }
+    $ui.CmbTextScale.SelectedIndex = $ts
+    if ($ts -gt 0) { Set-TextScale $script:TextScales[$ts] }
+    $ui.CmbTextScale.Add_SelectionChanged({
+            if ($script:Loading -or $ui.CmbTextScale.SelectedIndex -lt 0) { return }
+            $i = $ui.CmbTextScale.SelectedIndex
+            Set-TextScale $script:TextScales[$i]
+            Set-Setting 'TextScale' @('100', '115', '130')[$i]
+        })
     $ui.ChkAlerts.IsChecked = ($cfg['Alerts'] -ne '0')
     $t = 85; [void][int]::TryParse($cfg['AlertGpuTemp'], [ref]$t)
     $ui.CmbAlertTemp.SelectedIndex = [math]::Max(0, [math]::Min(3, [int](($t - 75) / 5)))
