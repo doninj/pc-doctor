@@ -1979,7 +1979,7 @@ function Get-MemoryInfo {
     [pscustomobject]@{
         Type = $type; Count = $mods.Count; Total = $total; PerModule = [double]$m.Capacity
         Configured = $cfg; Kit = $kit; Part = $part; Maker = ([string]$m.Manufacturer).Trim()
-        XmpState = $state; XmpText = $text
+        XmpState = $state; XmpText = $text; AboveSpec = ($state -eq 'On' -and $cfg -gt $jedec)
     }
 }
 
@@ -2523,7 +2523,7 @@ function Get-Findings($d) {
     if ($cs.Disk.Count) { & $add 'Critique' "$($cs.Disk.Count) erreur(s) de disque ces 30 derniers jours" "Signe possible d'un disque qui fatigue ou d'un câble défectueux. Sauvegardez vos données importantes." 'Voir les solutions' 'goto:solutions' }
     if ($cs.Tdr.Count) { & $add 'Attention' "Le pilote graphique a planté $($cs.Tdr.Count) fois" "Écran noir quelques secondes ou jeu qui crashe : réinstallez proprement le pilote graphique." 'Voir les solutions' 'goto:solutions' }
     foreach ($a in @($cs.AppGroups | Where-Object { $_.Count -ge 2 } | Select-Object -First 3)) { & $add 'Attention' "« $($a.Name) » a planté ou figé $($a.Count) fois" "Mettez ce logiciel à jour, réinstallez-le, ou désactivez-le s'il se lance au démarrage." 'Voir les plantages' 'goto:crashes' }
-    if ($d.Memory -and $d.Memory.XmpState -eq 'On' -and $cs.Silent.Count) { & $add 'Attention' "RAM overclockée (profil EXPO/XMP à $($d.Memory.Configured) MT/s)" "Première piste pour les coupures nettes : désactivez EXPO/XMP dans le BIOS quelques jours pour tester." 'Voir les solutions' 'goto:solutions' }
+    if ($d.Memory -and $d.Memory.AboveSpec -and $cs.Silent.Count) { & $add 'Attention' "RAM overclockée (profil EXPO/XMP à $($d.Memory.Configured) MT/s)" "Première piste pour les coupures nettes : désactivez EXPO/XMP dans le BIOS quelques jours pour tester." 'Voir les solutions' 'goto:solutions' }
     $ocRun = @($d.OcTools | Where-Object { $_ -and $_.Running })
     if ($ocRun.Count) { & $add $(if ($cs.Hard.Count) { 'Attention' } else { 'Info' }) "Logiciel d'overclocking actif : $(($ocRun | ForEach-Object { $_.Name }) -join ', ')" "Un overclocking de la carte graphique ou du processeur peut provoquer gels et coupures. Remettez les réglages d'usine pour tester." 'Voir les performances' 'goto:perf' }
     $probs = @($d.ProblemDevices | Where-Object { $_ -and $_.Serious })
@@ -2659,7 +2659,8 @@ function Get-Solutions($d) {
     $ramRec = ($silent -ge 1 -or $bsod -ge 1)
     $ramTitle = "Désactiver l'overclocking de la RAM (EXPO / XMP)"
     $ramState = ''
-    if ($mem -and $mem.XmpState -eq 'On') { $ramState = " Sur votre PC, la RAM tourne à $($mem.Configured) MT/s : le profil EXPO/XMP est bien activé." }
+    if ($mem -and $mem.AboveSpec) { $ramState = " Sur votre PC, la RAM tourne à $($mem.Configured) MT/s, au-dessus de la vitesse officielle du processeur : c'est le premier test à faire." }
+    elseif ($mem -and $mem.XmpState -eq 'On') { $ramState = " Sur votre PC, la RAM tourne à $($mem.Configured) MT/s, la vitesse prévue du kit et supportée par le processeur : à désactiver seulement si le test de stabilité trouve des erreurs mémoire."; $ramRec = $false; $ramTitle += ' : seulement en cas d''erreurs' }
     elseif ($mem -and $mem.XmpState -eq 'Off') { $ramState = " Sur votre PC, la RAM tourne déjà en dessous de la vitesse du kit ($($mem.Configured) MT/s) : ce test est déjà fait."; $ramRec = $false; $ramTitle += ' : déjà fait' }
     & $addS $ramRec $ramTitle `
         ("Les coupures nettes et écrans bleus aléatoires viennent très souvent d'une RAM poussée au-delà de ce qu'elle tient vraiment (profil EXPO/XMP activé dans le BIOS)$(if ($isAmdCpu) { ', particulièrement sur les processeurs Ryzen' }). C'est gratuit, rapide et réversible : c'est le premier test à faire." + $ramState) `
