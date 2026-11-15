@@ -6242,12 +6242,12 @@ Read-Host 'Appuyez sur Entree pour fermer'
         $ui.TxtBootSs.Text = if ($null -ne $b.Session) { "Jusqu'à la session : {0:N0} s" -f $b.Session } else { 'Session : non mesurée' }
         $tips = New-Object System.Collections.Generic.List[string]
         $fwAvg = ($boots | Measure-Object Firmware -Average).Average
-        if ($fwAvg -ge 12) { $tips.Add(("• La carte mère met {0:N0} s en moyenne avant de lancer Windows (normal : 5 à 10 s). Dans le BIOS, activez « Fast Boot », désactivez le « CSM » si Windows est installé en UEFI, et le logo de démarrage. Après un changement de RAM ou de réglage du BIOS, le premier démarrage est toujours plus long (test de la mémoire), c'est normal." -f $fwAvg)) }
-        if ($b.Loader -ge 8) { $tips.Add(("• Le chargement de Windows prend {0:N1} s (souvent 3 à 6 s). Un disque système lent ou presque plein, ou les fonctions de virtualisation (Hyper-V, WSL) peuvent l'allonger." -f $b.Loader)) }
-        if ($null -ne $b.Session -and $b.Session -ge 40) { $tips.Add(("• L'ouverture de session prend {0:N0} s (temps de saisie du code compris). Moins de programmes au démarrage (liste ci-dessous) l'accélère." -f $b.Session)) }
-        foreach ($c in @($r.Culprits)) { $tips.Add(("• « {0} » a ralenti le démarrage de {1:N1} s en moyenne ({2} fois en 30 jours)." -f $c.Name, $c.Seconds, $c.Count)) }
+        if ($fwAvg -ge 12) { $tips.Add(("• Carte mère lente : {0:N0} s (normal 5 à 10 s). BIOS : activer Fast Boot, désactiver CSM et logo." -f $fwAvg)) }
+        if ($b.Loader -ge 8) { $tips.Add(("• Windows lent à charger : {0:N1} s (normal 3 à 6 s). Disque lent ou plein, ou Hyper-V / WSL." -f $b.Loader)) }
+        if ($null -ne $b.Session -and $b.Session -ge 40) { $tips.Add(("• Session longue : {0:N0} s (saisie du code comprise). Désactiver des programmes ci-dessous." -f $b.Session)) }
+        foreach ($c in @($r.Culprits)) { $tips.Add(("• « {0} » : +{1:N1} s ({2} fois en 30 jours)." -f $c.Name, $c.Seconds, $c.Count)) }
         if (-not $tips.Count) { $tips.Add('• Démarrage rapide : rien à améliorer.') }
-        if (-not $r.CanReadDetails) { $tips.Add('En mode administrateur, PC Doctor indique aussi quels programmes ou pilotes ralentissent le démarrage.') }
+        if (-not $r.CanReadDetails) { $tips.Add('• Mode administrateur : détail des programmes qui ralentissent.') }
         $ui.TxtBootAdvice.Text = ($tips -join "`n")
     }
     function Load-BootTimes { Start-BgJob 'Get-BootTimes 10' { param($res) try { Show-BootTimes (@($res)[0]) } catch { Write-Log "Démarrage : $_ $($_.ScriptStackTrace)" } } }
