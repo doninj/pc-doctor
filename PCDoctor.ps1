@@ -1967,13 +1967,13 @@ function Get-MemoryInfo {
     $base = switch ($type) { 'DDR4' { 2666 } 'DDR5' { 4800 } 'DDR3' { 1333 } default { 0 } }
     if ($kit -and $cfg -lt ($kit - 100)) {
         $state = 'Off'
-        $text = "La RAM tourne à $cfg MT/s alors que le kit est prévu pour $kit MT/s : le profil EXPO/XMP est désactivé. C'est la configuration la plus stable (un peu moins rapide)."
+        $text = "Profil désactivé : $cfg au lieu de $kit MT/s. Le plus stable, un peu moins rapide."
     } elseif ($cfg -gt $jedec -or ($kit -and $kit -gt $base -and $cfg -ge ($kit - 100))) {
         $state = 'On'
-        $text = "La RAM tourne à $cfg MT/s, au-dessus de la vitesse standard : le profil EXPO/XMP/DOCP est activé. C'est un overclocking de la RAM, prévu par le fabricant, mais pas toujours stable selon le processeur et la carte mère."
+        $text = if ($cfg -le $jedec) { "Vitesse prévue par le fabricant du kit, supportée par le processeur." } else { "Au-dessus de la norme du processeur : overclocking, pas toujours stable." }
     } else {
         $state = 'Base'
-        $text = "La RAM tourne à sa vitesse standard ($cfg MT/s) : pas d'overclocking."
+        $text = "Vitesse standard : pas d'overclocking."
     }
     $total = [double]($mods | Measure-Object Capacity -Sum).Sum
     [pscustomobject]@{
@@ -1987,11 +1987,11 @@ function Get-MemoryInfo {
 function Get-CpuOcInfo {
     $c = Get-CimInstance Win32_Processor | Select-Object -First 1
     $name = ([string]$c.Name).Trim()
-    $note = if ($name -match 'X3D') { "Processeur X3D : il ne s'overclocke pas de façon classique. Seuls le PBO et le Curve Optimizer existent dans le BIOS : s'ils ont été réglés, remettez-les sur « Auto » pour tester la stabilité." }
-    elseif ($name -match 'Ryzen') { "Processeur Ryzen : l'overclocking se fait dans le BIOS (PBO, Curve Optimizer) ou avec Ryzen Master. Un Curve Optimizer trop agressif provoque des plantages aléatoires : remettez « Auto » pour tester." }
-    elseif ($name -match 'i[3579]-1[34]\d{3}') { "Intel Core 13e/14e génération : ces processeurs ont un défaut d'instabilité connu. Mettez absolument le BIOS à jour (microcode 0x12B ou plus récent) et gardez les réglages Intel par défaut." }
-    elseif ($name -match 'i[3579]-\d{4,5}K') { "Processeur Intel « K » débloqué : un overclocking ou undervolt (BIOS, Intel XTU, ThrottleStop) peut rendre le PC instable. Remettez les réglages par défaut pour tester." }
-    else { "Ce processeur fonctionne à ses réglages d'usine : pas d'overclocking à surveiller." }
+    $note = if ($name -match 'X3D') { "Pas d'overclocking classique. Si PBO ou Curve Optimizer ont été réglés dans le BIOS, remettez « Auto »." }
+    elseif ($name -match 'Ryzen') { "En cas de plantages, remettez PBO et Curve Optimizer sur « Auto » dans le BIOS." }
+    elseif ($name -match 'i[3579]-1[34]\d{3}') { "Défaut d'instabilité connu : mettez le BIOS à jour (microcode 0x12B ou plus) et gardez les réglages Intel par défaut." }
+    elseif ($name -match 'i[3579]-\d{4,5}K') { "En cas d'instabilité, retirez overclocking et undervolt (BIOS, XTU, ThrottleStop)." }
+    else { "Réglages d'usine : rien à surveiller." }
     [pscustomobject]@{ Name = $name; MaxClock = [int]$c.MaxClockSpeed; Cores = [int]$c.NumberOfCores; Threads = [int]$c.NumberOfLogicalProcessors; Note = $note }
 }
 
@@ -2783,6 +2783,7 @@ $xamlText = @'
   <Window.Resources>
     <FontFamily x:Key="Icons">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
     <SolidColorBrush x:Key="Muted" Color="#FF475569"/>
+    <BooleanToVisibilityConverter x:Key="B2V"/>
     <SolidColorBrush x:Key="Line" Color="#FFE2E8F0"/>
     <SolidColorBrush x:Key="Accent" Color="#FF3B6EF5"/>
 
@@ -4103,7 +4104,8 @@ $xamlText = @'
                           <Button Content="75 %" Tag="gpu-pl:75" Style="{StaticResource Secondary}" Margin="0,0,8,6"/>
                           <Button Content="70 %" Tag="gpu-pl:70" Style="{StaticResource Secondary}" Margin="0,0,8,6"/>
                         </WrapPanel>
-                        <TextBlock Style="{StaticResource MutedText}" FontSize="12" TextWrapping="Wrap" Margin="0,6,0,0" Text="Test d'alimentation : à 75 %, la carte évite les pics de consommation (environ 5 % de FPS en moins en jeu). Si les coupures disparaissent, l'alimentation est en cause. Revient à 100 % au redémarrage."/>
+                        <ToggleButton x:Name="TgGpuPl" Style="{StaticResource DetailsToggle}" HorizontalAlignment="Left" Margin="0,4,0,0"/>
+                        <TextBlock Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,6,0,0" LineHeight="20" Visibility="{Binding IsChecked, ElementName=TgGpuPl, Converter={StaticResource B2V}}" Text="Test d'alimentation : à 75 %, la carte évite ses pics de consommation (environ 5 % de FPS en moins). Si les coupures disparaissent, l'alimentation est en cause. Retour à 100 % au redémarrage."/>
                       </StackPanel>
                     </Border>
                   </StackPanel>
@@ -4148,7 +4150,7 @@ $xamlText = @'
                   <StackPanel>
                     <TextBlock Text="MODE D'ALIMENTATION WINDOWS" Style="{StaticResource MutedText}" FontSize="11.5" FontWeight="SemiBold"/>
                     <TextBlock x:Name="TxtPowerPlan" Text="…" FontSize="15" FontWeight="SemiBold" Margin="0,2,0,2" TextWrapping="Wrap"/>
-                    <TextBlock Style="{StaticResource MutedText}" TextWrapping="Wrap" Text="« Performances élevées » garde le processeur prêt à tout moment (un peu plus de consommation)."/>
+                    <TextBlock Style="{StaticResource MutedText}" TextWrapping="Wrap" Text="Les deux conviennent pour jouer."/>
                     <WrapPanel Margin="0,12,0,0">
                       <Button Content="Équilibré" Tag="power:balanced" Style="{StaticResource Secondary}" Margin="0,0,8,6"/>
                       <Button Content="Performances élevées" Tag="power:high" Style="{StaticResource Secondary}" Margin="0,0,8,6"/>
@@ -5187,7 +5189,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
             if ($g.Temp -gt $script:GpuMaxTemp) { $script:GpuMaxTemp = $g.Temp }
             $ui.TxtGpuTemp.Text = "{0:N0} °C" -f $g.Temp
             Set-Bar $ui.BarGpuTemp $g.Temp 75 85
-            $ui.TxtGpuTempMax.Text = "max {0:N0} °C depuis l'ouverture de PC Doctor" -f $script:GpuMaxTemp
+            $ui.TxtGpuTempMax.Text = "max {0:N0} °C" -f $script:GpuMaxTemp
         }
         if ($null -ne $g.Power) {
             if ($g.Power -gt $script:GpuMaxPower) { $script:GpuMaxPower = $g.Power }
@@ -5209,7 +5211,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
         $ui.TxtGpuFan.Text = if ($null -ne $g.Fan) { "ventilateurs à {0:N0} %" -f $g.Fan } else { 'ventilateurs : —' }
         if ($g.PowerDefault) {
             $pct = 100 * $g.PowerLimit / $g.PowerDefault
-            $ui.TxtGpuLimit.Text = "Limite actuelle : {0:N0} W, soit {1:N0} % de la normale ({2:N0} W)." -f $g.PowerLimit, $pct, $g.PowerDefault
+            $ui.TxtGpuLimit.Text = "Actuelle : {0:N0} W ({1:N0} %)." -f $g.PowerLimit, $pct
         }
     }
 
@@ -5245,12 +5247,12 @@ Read-Host 'Appuyez sur Entree pour fermer'
             $ui.TxtRamTitle.Text = "{0} × {1} {2}  ·  {3:N0} MT/s" -f $m.Count, (Format-Size $m.PerModule), $m.Type, $m.Configured
             $ui.TxtRamDetail.Text = "$(Format-Size $m.Total) au total" + $(if ($m.Kit) { "  ·  kit prévu pour $($m.Kit) MT/s" } else { '' }) + $(if ($m.Part) { "  ·  $($m.Maker) $($m.Part)".TrimEnd() } else { '' })
             switch ($m.XmpState) {
-                'On' { $ui.RamPillText.Text = 'EXPO / XMP activé (overclocking)'; $ui.RamPill.Background = Get-Brush '#FFFFF1DB'; $ui.RamPillText.Foreground = Get-Brush '#FFB45309' }
+                'On' { $ui.RamPillText.Text = 'EXPO / XMP activé'; $ui.RamPill.Background = Get-Brush '#FFFFF1DB'; $ui.RamPillText.Foreground = Get-Brush '#FFB45309' }
                 'Off' { $ui.RamPillText.Text = 'EXPO / XMP désactivé'; $ui.RamPill.Background = Get-Brush '#FFE3F7EA'; $ui.RamPillText.Foreground = Get-Brush '#FF15803D' }
                 default { $ui.RamPillText.Text = 'Vitesse standard'; $ui.RamPill.Background = Get-Brush '#FFE8EFFE'; $ui.RamPillText.Foreground = Get-Brush '#FF3B6EF5' }
             }
             $adv = $m.XmpText
-            if ($m.XmpState -eq 'On' -and @($d.Crashes | Where-Object { $_ -and $_.Category -eq 'Arrêt brutal' }).Count) { $adv += " Avec les coupures détectées, désactivez-le quelques jours pour tester (bouton ci-dessous, puis voir les étapes dans Solutions)." }
+            if ($m.XmpState -eq 'On' -and @($d.Crashes | Where-Object { $_ -and $_.Category -eq 'Arrêt brutal' }).Count) { $adv += " Si le test de stabilité trouve des erreurs mémoire, désactivez-le." }
             $ui.TxtRamAdvice.Text = $adv
         }
         $c = $d.Cpu
@@ -5262,10 +5264,10 @@ Read-Host 'Appuyez sur Entree pour fermer'
         $oc = @($d.OcTools | Where-Object { $_ })
         if ($oc.Count) {
             $ui.TxtOcTools.Text = ($oc | ForEach-Object { "$($_.Name)$(if ($_.Running) { ' (actif)' } else { ' (installé)' })" }) -join ', '
-            $ui.TxtOcToolsAdvice.Text = "Si vous avez réglé un overclocking ou un undervolt avec ces logiciels, cliquez sur « Reset » dedans et désactivez l'application des réglages au démarrage, le temps de tester la stabilité."
+            $ui.TxtOcToolsAdvice.Text = "En cas d'instabilité : « Reset » dans le logiciel, et ne plus appliquer ses réglages au démarrage."
         } else {
             $ui.TxtOcTools.Text = 'Aucun détecté'
-            $ui.TxtOcToolsAdvice.Text = "Ni MSI Afterburner, ni Ryzen Master, ni Intel XTU n'ont été trouvés : pas d'overclocking logiciel sur ce PC. Un éventuel overclocking ne peut venir que du BIOS (EXPO/XMP, PBO)."
+            $ui.TxtOcToolsAdvice.Text = "Pas d'overclocking logiciel sur ce PC."
         }
         $ui.TxtPowerPlan.Text = if ($d.Summary.PowerPlanName) { $d.Summary.PowerPlanName } else { Get-PowerPlanName }
         $disks = @($d.Disks | Where-Object { $_ })
