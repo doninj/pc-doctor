@@ -1113,7 +1113,7 @@ if (-not ('PCDoctor.DiskScanner' -as [type])) { Add-Type -TypeDefinition $csharp
 # ---------------------------------------------------------------------------
 #  Réglages partagés (appli + boîte noire) : %LOCALAPPDATA%\PCDoctor\settings.ini
 # ---------------------------------------------------------------------------
-$script:AppVersion = '2.7.0'
+$script:AppVersion = '2.8.0'
 $script:Repo = 'doninj/pc-doctor'
 $script:SettingsFile = Join-Path $script:LogDir 'settings.ini'
 $script:BlackBoxDir = Join-Path $script:LogDir 'boite-noire'
@@ -2037,6 +2037,44 @@ function Get-ProblemDevices {
             if ($name -match 'Virtual|Virtuel') { $serious = $false }
             [pscustomobject]@{ Name = $name; Class = [string]$_.PNPClass; Code = $code; Problem = $problem; Serious = $serious }
         }
+}
+
+# --- Durée des démarrages : mesures de la carte mère (Kernel-Boot 30), du noyau et de l'ouverture de session ---
+function Get-BootTimes([int]$Max = 10) {
+    $q = { param($prov, $id, $n) @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = $prov; Id = $id } -MaxEvents $n -ErrorAction SilentlyContinue) }
+    $fw = & $q 'Microsoft-Windows-Kernel-Boot' 30 $Max
+    $types = & $q 'Microsoft-Windows-Kernel-Boot' 27 ($Max * 2)
+    $kern = & $q 'Microsoft-Windows-Kernel-General' 12 ($Max * 2)
+    $logons = & $q 'Microsoft-Windows-Winlogon' 7001 ($Max * 3)
+    $near = { param($list, $t) $list | Where-Object { [math]::Abs(($_.TimeCreated - $t).TotalSeconds) -lt 120 } | Sort-Object { [math]::Abs(($_.TimeCreated - $t).TotalSeconds) } | Select-Object -First 1 }
+    $boots = foreach ($e in $fw) {
+        $d = @{}; foreach ($x in ([xml]$e.ToXml()).Event.EventData.Data) { $v = 0.0; [void][double]::TryParse([string]$x.'#text', [ref]$v); $d[$x.Name] = $v }
+        if (-not $d['StartOSImageStart'] -or -not $d['ExitBootServicesEntry']) { continue }
+        $k = & $near $kern $e.TimeCreated
+        $kt = if ($k) { $k.TimeCreated } else { $e.TimeCreated }
+        # la session doit s'ouvrir avant le démarrage suivant
+        $next = $kern | Where-Object { $_.TimeCreated -gt $kt.AddSeconds(5) } | Sort-Object TimeCreated | Select-Object -First 1
+        $limit = if ($next -and $next.TimeCreated -lt $kt.AddMinutes(15)) { $next.TimeCreated } else { $kt.AddMinutes(15) }
+        $lg = $logons | Where-Object { $_.TimeCreated -gt $kt -and $_.TimeCreated -lt $limit } | Sort-Object TimeCreated | Select-Object -First 1
+        $ty = & $near $types $e.TimeCreated
+        $fwS = $d['StartOSImageStart'] / 1000; $ldS = ($d['ExitBootServicesEntry'] - $d['StartOSImageStart']) / 1000
+        $ss = if ($lg) { ($lg.TimeCreated - $kt).TotalSeconds } else { $null }
+        [pscustomobject]@{
+            Date = $kt; Firmware = $fwS; Loader = $ldS; Session = $ss
+            Total = $(if ($null -ne $ss) { $fwS + $ldS + $ss } else { $null })
+            Type = $(switch ([int]$(if ($ty) { $ty.Properties[0].Value } else { 0 })) { 1 { 'Démarrage rapide' } 2 { 'Sortie de veille prolongée' } default { 'Démarrage complet' } })
+            DateText = $kt.ToString('dd/MM HH:mm'); FirmwareText = ('{0:N1} s' -f $fwS); LoaderText = ('{0:N1} s' -f $ldS)
+            SessionText = $(if ($null -ne $ss) { '{0:N0} s' -f $ss } else { '—' }); TotalText = $(if ($null -ne $ss) { '{0:N0} s' -f ($fwS + $ldS + $ss) } else { '—' })
+        }
+    }
+    # Ce qui ralentit le démarrage (journal réservé au mode administrateur)
+    $culprits = @()
+    try {
+        $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Diagnostics-Performance/Operational'; Id = 101, 102, 103, 106, 109; StartTime = (Get-Date).AddDays(-30) } -ErrorAction Stop)
+        $culprits = @($ev | ForEach-Object { $d = @{}; foreach ($x in ([xml]$_.ToXml()).Event.EventData.Data) { $d[$x.Name] = [string]$x.'#text' }; [pscustomobject]@{ Name = $(if ($d['FriendlyName']) { $d['FriendlyName'] } else { $d['Name'] }); Ms = [double]$d['DegradationTime'] } } |
+            Where-Object { $_.Name } | Group-Object Name | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Count = $_.Count; Seconds = ($_.Group | Measure-Object Ms -Average).Average / 1000 } } | Sort-Object Seconds -Descending | Select-Object -First 5)
+    } catch {}
+    [pscustomobject]@{ Boots = @($boots); Culprits = $culprits; CanReadDetails = $(try { [void](Get-WinEvent -ListLog 'Microsoft-Windows-Diagnostics-Performance/Operational' -ErrorAction Stop); $true } catch { $false }) }
 }
 
 function Get-FastStartup {
@@ -4192,6 +4230,43 @@ $xamlText = @'
             <StackPanel DockPanel.Dock="Top">
               <TextBlock Style="{StaticResource PageTitle}" Text="Programmes au démarrage"/>
               <TextBlock x:Name="TxtStartupInfo" Style="{StaticResource PageSub}"/>
+              <Border x:Name="BootCard" Style="{StaticResource Card}" Margin="0,16,0,0" Padding="18,14" Visibility="Collapsed">
+                <StackPanel>
+                  <DockPanel>
+                    <Button x:Name="BtnBootHistory" DockPanel.Dock="Right" Content="Historique" Style="{StaticResource Small}" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="TxtBootAvg" DockPanel.Dock="Right" Style="{StaticResource MutedText}" FontSize="12.5" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                    <TextBlock x:Name="TxtBootTitle" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                  </DockPanel>
+                  <Grid x:Name="BootBar" Height="10" Margin="0,12,0,6">
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition x:Name="BootColFw" Width="1*"/>
+                      <ColumnDefinition x:Name="BootColLd" Width="1*"/>
+                      <ColumnDefinition x:Name="BootColSs" Width="1*"/>
+                    </Grid.ColumnDefinitions>
+                    <Border Background="#FFF59E0B" CornerRadius="5,0,0,5" Margin="0,0,2,0"/>
+                    <Border Grid.Column="1" Background="#FF3B6EF5" Margin="0,0,2,0"/>
+                    <Border Grid.Column="2" Background="#FF22C55E" CornerRadius="0,5,5,0"/>
+                  </Grid>
+                  <WrapPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,18,0"><Ellipse Width="8" Height="8" Fill="#FFF59E0B" VerticalAlignment="Center"/><TextBlock x:Name="TxtBootFw" FontSize="12.5" Margin="6,0,0,0"/></StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,18,0"><Ellipse Width="8" Height="8" Fill="#FF3B6EF5" VerticalAlignment="Center"/><TextBlock x:Name="TxtBootLd" FontSize="12.5" Margin="6,0,0,0"/></StackPanel>
+                    <StackPanel Orientation="Horizontal"><Ellipse Width="8" Height="8" Fill="#FF22C55E" VerticalAlignment="Center"/><TextBlock x:Name="TxtBootSs" FontSize="12.5" Margin="6,0,0,0"/></StackPanel>
+                  </WrapPanel>
+                  <TextBlock x:Name="TxtBootAdvice" TextWrapping="Wrap" Margin="0,10,0,0" LineHeight="19" Foreground="#FF475569"/>
+                  <Border x:Name="BootHistoryBox" Style="{StaticResource Panel}" Margin="0,10,0,0" Visibility="Collapsed">
+                    <DataGrid x:Name="GridBoots" MaxHeight="220">
+                      <DataGrid.Columns>
+                        <DataGridTextColumn Header="DÉMARRAGE" Binding="{Binding DateText}" SortMemberPath="Date" Width="110"/>
+                        <DataGridTextColumn Header="CARTE MÈRE" Binding="{Binding FirmwareText}" SortMemberPath="Firmware" Width="110"/>
+                        <DataGridTextColumn Header="WINDOWS" Binding="{Binding LoaderText}" SortMemberPath="Loader" Width="95"/>
+                        <DataGridTextColumn Header="SESSION" Binding="{Binding SessionText}" SortMemberPath="Session" Width="90"/>
+                        <DataGridTextColumn Header="TOTAL" Binding="{Binding TotalText}" SortMemberPath="Total" Width="80"/>
+                        <DataGridTextColumn Header="TYPE" Binding="{Binding Type}" Width="*"/>
+                      </DataGrid.Columns>
+                    </DataGrid>
+                  </Border>
+                </StackPanel>
+              </Border>
               <WrapPanel Margin="0,16,0,14">
                 <Button x:Name="BtnDisableRecommended" Margin="0,0,8,6">
                   <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE945;" FontFamily="{StaticResource Icons}" Margin="0,1,8,0"/><TextBlock x:Name="TxtDisableRecommended" Text="Désactiver les programmes conseillés"/></StackPanel>
@@ -5980,6 +6055,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
                 $t = @(); try { $t = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object { $_.InitialDetectionTime -ge (Get-Date).AddHours(-1) }) } catch {}
                 Set-Status $(if ($t.Count) { "Analyse terminée : $($t.Count) menace(s) trouvée(s) et traitée(s) par Microsoft Defender." } else { 'Analyse antivirus terminée : aucune menace trouvée.' })
                 Load-Security
+            Load-BootTimes
             try { Show-Gaming } catch { Write-Log "Jeu : $_ $($_.ScriptStackTrace)" }
             } else {
                 Set-Status 'L''analyse n''a pas pu être lancée d''ici (autre antivirus, ou droits insuffisants) : ouverture de Sécurité Windows.'
@@ -6144,6 +6220,38 @@ Read-Host 'Appuyez sur Entree pour fermer'
             Show-Gaming
             Set-Status $(if ($done -eq $fix.Count) { "$done réglage(s) appliqué(s)." } else { "$done réglage(s) sur $($fix.Count) appliqué(s) : les autres demandent les droits administrateur." })
         })
+
+    # =====================================================================
+    #  Durée de démarrage (page Démarrage)
+    # =====================================================================
+    function Show-BootTimes($r) {
+        $boots = @($r.Boots | Where-Object { $_ } | Sort-Object Date -Descending)
+        if (-not $boots.Count) { $ui.BootCard.Visibility = 'Collapsed'; return }
+        $ui.BootCard.Visibility = 'Visible'
+        $ui.GridBoots.ItemsSource = $boots
+        $b = $boots[0]
+        $ss = if ($null -ne $b.Session) { [math]::Min($b.Session, 120) } else { 0 }
+        $ui.TxtBootTitle.Text = if ($null -ne $b.Total) { "Dernier démarrage : {0:N0} s jusqu'à l'ouverture de session" -f $b.Total } else { "Dernier démarrage : {0:N0} s jusqu'à l'écran de connexion" -f ($b.Firmware + $b.Loader) }
+        $ok = @($boots | Where-Object { $null -ne $_.Total -and $_.Session -lt 180 })
+        $ui.TxtBootAvg.Text = if ($ok.Count -ge 2) { "moyenne sur {0} démarrages : {1:N0} s" -f $ok.Count, ($ok | Measure-Object Total -Average).Average } else { '' }
+        $ui.BootColFw.Width = New-Object System.Windows.GridLength([math]::Max(0.5, $b.Firmware), 'Star')
+        $ui.BootColLd.Width = New-Object System.Windows.GridLength([math]::Max(0.5, $b.Loader), 'Star')
+        $ui.BootColSs.Width = New-Object System.Windows.GridLength([math]::Max(0.5, $ss), 'Star')
+        $ui.TxtBootFw.Text = "Carte mère (BIOS) : {0:N1} s" -f $b.Firmware
+        $ui.TxtBootLd.Text = "Chargement de Windows : {0:N1} s" -f $b.Loader
+        $ui.TxtBootSs.Text = if ($null -ne $b.Session) { "Jusqu'à la session : {0:N0} s" -f $b.Session } else { 'Session : non mesurée' }
+        $tips = New-Object System.Collections.Generic.List[string]
+        $fwAvg = ($boots | Measure-Object Firmware -Average).Average
+        if ($fwAvg -ge 12) { $tips.Add(("• La carte mère met {0:N0} s en moyenne avant de lancer Windows (normal : 5 à 10 s). Dans le BIOS, activez « Fast Boot », désactivez le « CSM » si Windows est installé en UEFI, et le logo de démarrage. Après un changement de RAM ou de réglage du BIOS, le premier démarrage est toujours plus long (test de la mémoire), c'est normal." -f $fwAvg)) }
+        if ($b.Loader -ge 8) { $tips.Add(("• Le chargement de Windows prend {0:N1} s (souvent 3 à 6 s). Un disque système lent ou presque plein, ou les fonctions de virtualisation (Hyper-V, WSL) peuvent l'allonger." -f $b.Loader)) }
+        if ($null -ne $b.Session -and $b.Session -ge 40) { $tips.Add(("• L'ouverture de session prend {0:N0} s (temps de saisie du code compris). Moins de programmes au démarrage (liste ci-dessous) l'accélère." -f $b.Session)) }
+        foreach ($c in @($r.Culprits)) { $tips.Add(("• « {0} » a ralenti le démarrage de {1:N1} s en moyenne ({2} fois en 30 jours)." -f $c.Name, $c.Seconds, $c.Count)) }
+        if (-not $tips.Count) { $tips.Add('• Démarrage rapide : rien à améliorer.') }
+        if (-not $r.CanReadDetails) { $tips.Add('En mode administrateur, PC Doctor indique aussi quels programmes ou pilotes ralentissent le démarrage.') }
+        $ui.TxtBootAdvice.Text = ($tips -join "`n")
+    }
+    function Load-BootTimes { Start-BgJob 'Get-BootTimes 10' { param($res) try { Show-BootTimes (@($res)[0]) } catch { Write-Log "Démarrage : $_ $($_.ScriptStackTrace)" } } }
+    $ui.BtnBootHistory.Add_Click({ $ui.BootHistoryBox.Visibility = if ($ui.BootHistoryBox.Visibility -eq 'Visible') { 'Collapsed' } else { 'Visible' } })
 
     # Alertes
     $ui.ChkAlerts.Add_Checked({ if (-not $script:Loading) { Set-Setting 'Alerts' '1' } })
@@ -6394,6 +6502,7 @@ Read-Host 'Appuyez sur Entree pour fermer'
     $window.Add_Loaded({
             Start-FullAnalysis
             Load-Security
+            Load-BootTimes
             try { Show-Gaming } catch { Write-Log "Jeu : $_ $($_.ScriptStackTrace)" }
             if ((Get-Settings)['CheckUpdates'] -ne '0') { Start-UpdateCheck $false }
         })
