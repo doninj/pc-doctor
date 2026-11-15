@@ -99,3 +99,36 @@ build/
 ## Licence
 
 [MIT](LICENSE)
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+*Signature de code gratuite fournie par SignPath.io, certificat de la SignPath Foundation.* (Signing is being set up; releases will be signed once the project is accepted.)
+
+**Team roles**
+
+| Role | Members |
+|---|---|
+| Committers and reviewers | [doninj](https://github.com/doninj) |
+| Approvers | [doninj](https://github.com/doninj) |
+
+Every signed release is built from this repository's source code by GitHub Actions and approved manually before signing.
+
+## Privacy policy
+
+PC Doctor does not collect, store or send any personal data. There is no telemetry, no account and no analytics. All analysis results stay on your PC (in `%LOCALAPPDATA%\PCDoctor`).
+
+The program connects to other systems only in these cases:
+
+| When | Connects to | Purpose |
+|---|---|---|
+| At startup (can be turned off in *Paramètres*) | GitHub API (`api.github.com`) | Check whether a newer version of PC Doctor exists |
+| When the user clicks *Mettre à jour* | GitHub (`github.com`) | Download the new version (its SHA-256 is verified) |
+| When the *Pilotes* page is opened | Windows Update (Microsoft) | Look for driver updates, through Windows' own update service |
+| When the *Logiciels* page is opened or an update is started | winget (Microsoft) | List and install software updates, through Microsoft's official tool |
+| When the user runs the network test | Cloudflare (`1.1.1.1`), Google (`8.8.8.8`), the local router | Measure ping and packet loss |
+
+None of these requests contain personal data. Links in the app (driver or tool websites) open in your browser only when you click them.
+
+*PC Doctor ne collecte et n'envoie aucune donnée personnelle. Il se connecte uniquement à GitHub pour les mises à jour (désactivable dans Paramètres), à Windows Update et winget (Microsoft) pour les pilotes et logiciels, et à 1.1.1.1 / 8.8.8.8 pour le test réseau.*
